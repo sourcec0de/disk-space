@@ -7,9 +7,9 @@ use nsh_base::button;
 use nsh_core::prelude::ComponentBuilder;
 use nsh_core::prelude::Cursor;
 use nsh_core::prelude::FontWeight;
-use nsh_core::prelude::IntoElement;
 use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::Styled;
+use nsh_core::prelude::View;
 use nsh_core::prelude::px;
 use nsh_core::prelude::text;
 use nsh_core::prelude::view;
@@ -22,7 +22,7 @@ use crate::state;
     clippy::too_many_lines,
     reason = "renders the 9-row category meter and safety-jail card in one cohesive panel"
 )]
-pub(crate) fn categories_sidebar(tree: &StorageTree) -> impl IntoElement {
+pub(crate) fn categories_sidebar(tree: &StorageTree) -> View {
     let browse = state::browse_signal().get();
     let root_node = tree.node(tree.root_id());
     let total_used = root_node.map_or(0, |node| node.total_bytes).max(1);

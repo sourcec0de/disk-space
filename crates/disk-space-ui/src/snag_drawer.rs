@@ -9,7 +9,6 @@ use nsh_base::input;
 use nsh_core::prelude::ComponentBuilder;
 use nsh_core::prelude::Cursor;
 use nsh_core::prelude::FontWeight;
-use nsh_core::prelude::IntoElement;
 use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::Styled;
 use nsh_core::prelude::View;
@@ -26,7 +25,7 @@ use crate::state;
     clippy::too_many_lines,
     reason = "snag drawer combines queue list, destruction mode selector, and safety warning"
 )]
-pub(crate) fn snag_drawer(tree: &StorageTree) -> impl IntoElement {
+pub(crate) fn snag_drawer(tree: &StorageTree) -> View {
     let snag = state::snag_signal().get();
     if !snag.drawer_open {
         return view();
@@ -56,7 +55,7 @@ pub(crate) fn snag_drawer(tree: &StorageTree) -> impl IntoElement {
                 .child((!items.is_empty()).then(|| {
                     button()
                         .accessibility_label("Clear queue")
-                        .on_press(|| state::snag_signal().update(|s| s.queue.clear()))
+                        .on_press(state::clear_snag_queue)
                         .cursor(Cursor::Pointer)
                         .child(
                             text("clear")
@@ -202,12 +201,7 @@ pub(crate) fn snag_drawer(tree: &StorageTree) -> impl IntoElement {
                     .child(
                         button()
                             .accessibility_label("Unstage item")
-                            .on_press(move || {
-                                let target = rel.clone();
-                                state::snag_signal().update(|s| {
-                                    s.queue.remove(&target);
-                                });
-                            })
+                            .on_press(move || state::unstage_item(&rel))
                             .cursor(Cursor::Pointer)
                             .child(
                                 text("×")

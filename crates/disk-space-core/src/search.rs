@@ -217,22 +217,40 @@ pub fn compute_aggregates(tree: &StorageTree, scope: NodeId, limit: usize) -> Ag
 }
 
 fn matches_text(name: &str, relative_path: &Path, needle: &str) -> bool {
-    if needle.is_empty() {
+    let trimmed = needle.trim();
+    if trimmed.is_empty() {
         return true;
     }
-    if let Some(ext_query) = needle.strip_prefix('.')
+    if let Some(ext_query) = trimmed.strip_prefix('.')
         && !ext_query.is_empty()
         && !ext_query.contains('/')
+        && !ext_query.contains('\\')
     {
         return Path::new(name)
             .extension()
             .is_some_and(|ext| ext.to_string_lossy().to_ascii_lowercase() == ext_query);
     }
-    name.to_ascii_lowercase().contains(needle)
-        || relative_path
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .contains(needle)
+
+    let normalized = trimmed.replace('\\', "/");
+    let clean = normalized.trim_matches('/');
+    if clean.is_empty() {
+        return true;
+    }
+
+    let name_lower = name.to_ascii_lowercase();
+    if !clean.contains('/') {
+        return name_lower.contains(clean);
+    }
+
+    // Explicit subpath queries must extend into the entry's own name, never match only an ancestor.
+    let rel_norm = relative_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let name_start = rel_norm.len().saturating_sub(name_lower.len());
+    rel_norm
+        .rfind(clean)
+        .is_some_and(|pos| pos.saturating_add(clean.len()) > name_start)
 }
 
 #[cfg(test)]
@@ -295,5 +313,87 @@ mod tests {
         let agg = compute_aggregates(&tree, tree.root_id(), 10);
         assert!(!agg.by_extension.is_empty());
         assert_eq!(agg.by_extension[0].extension, "dmg");
+    }
+
+    #[test]
+    fn search_excludes_non_matching_descendants_of_matching_parent_dir() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let root_dir = outer.path().join("downloads");
+        let report_data = root_dir.join("playwright-report-core/data");
+        let other = root_dir.join("other");
+        fs::create_dir_all(&report_data).expect("mkdir report_data");
+        fs::create_dir_all(&other).expect("mkdir other");
+
+        fs::write(report_data.join("8a4f9c.webm"), vec![1_u8; 4_096]).expect("write webm");
+        fs::write(
+            root_dir.join("playwright-report-core/index.html"),
+            vec![2_u8; 1_024],
+        )
+        .expect("write html");
+        fs::write(
+            root_dir.join("playwright-report-core/playwright-trace.zip"),
+            vec![3_u8; 2_048],
+        )
+        .expect("write trace");
+        fs::write(other.join("playwright.config.ts"), vec![4_u8; 512]).expect("write config");
+
+        let host = FakePlatform::new(root_dir.clone());
+        let scan_root_val = ScanRoot::new(&root_dir, &host).expect("scan root");
+        let tree = scan_root(
+            scan_root_val,
+            &host,
+            &ScanOptions::default(),
+            &ScanCancelHandle::new(),
+            &mut |_| {},
+        )
+        .expect("scan");
+
+        let hits = search_tree(
+            &tree,
+            &SearchQuery {
+                text: "playwright".to_owned(),
+                ..SearchQuery::default()
+            },
+        );
+        let hit_names: Vec<&str> = hits
+            .iter()
+            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .collect();
+        assert_eq!(
+            hit_names,
+            vec![
+                "playwright-report-core",
+                "playwright-trace.zip",
+                "playwright.config.ts"
+            ]
+        );
+        assert!(!hit_names.contains(&"8a4f9c.webm"));
+        assert!(!hit_names.contains(&"index.html"));
+
+        let webm_hits = search_tree(
+            &tree,
+            &SearchQuery {
+                text: ".webm".to_owned(),
+                ..SearchQuery::default()
+            },
+        );
+        let webm_names: Vec<&str> = webm_hits
+            .iter()
+            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .collect();
+        assert_eq!(webm_names, vec!["8a4f9c.webm"]);
+
+        let subpath_hits = search_tree(
+            &tree,
+            &SearchQuery {
+                text: "playwright-report-core/data".to_owned(),
+                ..SearchQuery::default()
+            },
+        );
+        let subpath_names: Vec<&str> = subpath_hits
+            .iter()
+            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .collect();
+        assert_eq!(subpath_names, vec!["data"]);
     }
 }

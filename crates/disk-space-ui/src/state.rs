@@ -1,5 +1,6 @@
 //! Reactive per-surface state, background scan execution, and destruction orchestration.
 
+use std::collections::HashSet;
 use std::env;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,8 +32,13 @@ use disk_space_core::search_tree;
 use disk_space_platform::PlatformHost;
 use disk_space_platform::StorageCategory;
 use disk_space_platform::native_platform;
+use nsh_core::LayoutAnimation;
+use nsh_core::LayoutCurve;
+use nsh_core::LayoutTransition;
 use nsh_core::prelude::Owner;
 use nsh_core::prelude::Signal;
+use nsh_core::prelude::animate_layout;
+use nsh_core::prelude::batch;
 use nsh_core::prelude::global;
 use nsh_core::prelude::spawn;
 use nsh_core::prelude::timer;
@@ -183,6 +189,11 @@ pub(crate) struct SnagState {
 }
 
 #[derive(Debug, Clone, Default)]
+pub(crate) struct ExitingState {
+    pub(crate) nodes: HashSet<NodeId>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct NoticeState {
     pub(crate) notice: Option<StatusNotice>,
 }
@@ -197,6 +208,10 @@ pub(crate) fn browse_signal() -> Signal<BrowseState> {
 
 pub(crate) fn snag_signal() -> Signal<SnagState> {
     global::<SnagState>()
+}
+
+pub(crate) fn exiting_signal() -> Signal<ExitingState> {
+    global::<ExitingState>()
 }
 
 pub(crate) fn notice_signal() -> Signal<NoticeState> {
@@ -251,11 +266,14 @@ pub(crate) fn start_scan(root_path: PathBuf) {
         browse.hover_sunburst = None;
     });
 
-    snag_signal().update(|snag| {
-        snag.queue.clear();
-        snag.confirm_open = false;
-        snag.erase_input.clear();
-        snag.last_report = None;
+    batch(|| {
+        snag_signal().update(|snag| {
+            snag.queue.clear();
+            snag.confirm_open = false;
+            snag.erase_input.clear();
+            snag.last_report = None;
+        });
+        exiting_signal().update(|exiting| exiting.nodes.clear());
     });
 
     let (tx, rx) = crossbeam_channel::unbounded::<ScanWorkerMsg>();
@@ -345,9 +363,8 @@ pub(crate) fn current_tree_untracked() -> Option<Arc<StorageTree>> {
     })
 }
 
-/// Computes the list of [`NodeId`]s visible in the main explorer list right now.
-pub(crate) fn visible_items(tree: &StorageTree) -> Vec<NodeId> {
-    let browse = browse_signal().get();
+/// Computes raw unsorted/sorted [`NodeId`]s matching the current scope and query.
+fn raw_scope_items(tree: &StorageTree, browse: &BrowseState) -> Vec<NodeId> {
     let trimmed_search = browse.search_text.trim();
     let has_search = !trimmed_search.is_empty();
 
@@ -371,6 +388,103 @@ pub(crate) fn visible_items(tree: &StorageTree) -> Vec<NodeId> {
         disk_space_core::search::sort_nodes(tree, &mut ids, browse.sort_order);
     }
     ids
+}
+
+fn filter_uncovered(
+    tree: &StorageTree,
+    raw: Vec<NodeId>,
+    queue: &SnagQueue,
+    exiting: Option<&HashSet<NodeId>>,
+) -> Vec<NodeId> {
+    raw.into_iter()
+        .filter(|&id| {
+            if exiting.is_some_and(|set| set.contains(&id)) {
+                return true;
+            }
+            tree.node(id)
+                .is_some_and(|node| !queue.is_covered(&node.relative_path))
+        })
+        .collect()
+}
+
+/// Computes active [`NodeId`]s in the explorer list (excluding snagged items).
+pub(crate) fn visible_items(tree: &StorageTree) -> Vec<NodeId> {
+    let browse = browse_signal().get();
+    let raw = raw_scope_items(tree, &browse);
+    snag_signal().with(|snag| filter_uncovered(tree, raw, &snag.queue, None))
+}
+
+fn visible_items_untracked(tree: &StorageTree) -> Vec<NodeId> {
+    let browse = browse_signal().get_untracked();
+    let raw = raw_scope_items(tree, &browse);
+    snag_signal().with_untracked(|snag| filter_uncovered(tree, raw, &snag.queue, None))
+}
+
+/// Computes [`NodeId`]s mounted in the explorer list, including rows mid pop-out animation.
+pub(crate) fn explorer_display_items(tree: &StorageTree) -> Vec<NodeId> {
+    let browse = browse_signal().get();
+    let raw = raw_scope_items(tree, &browse);
+    exiting_signal().with(|exiting| {
+        snag_signal().with(|snag| filter_uncovered(tree, raw, &snag.queue, Some(&exiting.nodes)))
+    })
+}
+
+fn explorer_display_items_untracked(tree: &StorageTree) -> Vec<NodeId> {
+    let browse = browse_signal().get_untracked();
+    let raw = raw_scope_items(tree, &browse);
+    exiting_signal().with_untracked(|exiting| {
+        snag_signal()
+            .with_untracked(|snag| filter_uncovered(tree, raw, &snag.queue, Some(&exiting.nodes)))
+    })
+}
+
+/// Returns total bytes in the active scope (selected directory, category, or root).
+pub(crate) fn current_scope_bytes(tree: &StorageTree) -> u64 {
+    browse_signal().with(|browse| {
+        let header_node_id = browse.current_node.unwrap_or_else(|| tree.root_id());
+        match (browse.current_node, browse.selected_category) {
+            (None, Some(cat)) => tree
+                .node(tree.root_id())
+                .map_or(0, |n| n.category_totals.get(cat)),
+            _ => tree.node(header_node_id).map_or(0, |n| n.total_bytes),
+        }
+    })
+}
+
+/// Returns `true` when `node_id` is the actively selected row in `visible_items`.
+pub(crate) fn is_row_selected(tree: &StorageTree, node_id: NodeId) -> bool {
+    let browse = browse_signal().get();
+    let visible = snag_signal().with(|snag| {
+        let raw = raw_scope_items(tree, &browse);
+        filter_uncovered(tree, raw, &snag.queue, None)
+    });
+    if visible.is_empty() {
+        return false;
+    }
+    let idx = browse.selected_row.min(visible.len() - 1);
+    visible.get(idx).copied() == Some(node_id)
+}
+
+/// Untracked check used in click handlers to determine whether `node_id` is currently selected.
+pub(crate) fn is_row_selected_untracked(tree: &StorageTree, node_id: NodeId) -> bool {
+    let browse = browse_signal().get_untracked();
+    let visible = snag_signal().with_untracked(|snag| {
+        let raw = raw_scope_items(tree, &browse);
+        filter_uncovered(tree, raw, &snag.queue, None)
+    });
+    if visible.is_empty() {
+        return false;
+    }
+    let idx = browse.selected_row.min(visible.len() - 1);
+    visible.get(idx).copied() == Some(node_id)
+}
+
+/// Selects `node_id` by updating `selected_row` to its index inside `visible_items`.
+pub(crate) fn select_visible_node(tree: &StorageTree, node_id: NodeId) {
+    let visible = visible_items_untracked(tree);
+    if let Some(pos) = visible.iter().position(|&id| id == node_id) {
+        browse_signal().update(|browse| browse.selected_row = pos);
+    }
 }
 
 pub(crate) fn set_notice(tone: NoticeTone, text: impl Into<String>) {
@@ -406,6 +520,7 @@ pub(crate) fn open_node(node_id: NodeId) {
         browse_signal().update(|browse| {
             browse.current_node = Some(node_id);
             browse.selected_row = 0;
+            browse.search_text.clear();
             browse.hover_sunburst = None;
         });
     } else {
@@ -480,7 +595,8 @@ pub(crate) fn reveal_node(node_id: NodeId) {
     }
 }
 
-pub(crate) fn toggle_snag_node(node_id: NodeId) {
+/// Stages `node_id` for destruction and triggers its pop-out exit animation from the explorer.
+pub(crate) fn snag_node(node_id: NodeId) {
     let Some(tree) = current_tree_untracked() else {
         return;
     };
@@ -488,29 +604,42 @@ pub(crate) fn toggle_snag_node(node_id: NodeId) {
         return;
     };
     let rel = node.relative_path.clone();
-    let host = create_host();
 
-    let already_snagged = snag_signal().with_untracked(|snag| snag.queue.is_snagged(&rel));
-    if already_snagged {
-        snag_signal().update(|snag| {
-            snag.queue.remove(&rel);
-        });
-        set_notice(
-            NoticeTone::Info,
-            format!("Removed `{}` from queue", node.name),
-        );
+    let already_snagged_or_exiting = snag_signal()
+        .with_untracked(|snag| snag.queue.is_covered(&rel))
+        || exiting_signal().with_untracked(|exiting| exiting.nodes.contains(&node_id));
+    if already_snagged_or_exiting {
         return;
     }
 
+    let host = create_host();
     let mut queue_copy = snag_signal().with_untracked(|snag| snag.queue.clone());
     match queue_copy.snag(tree.root(), node, host.as_ref()) {
         Ok(SnagOutcome::Added {
             consolidated_children,
         }) => {
-            snag_signal().update(|snag| {
-                snag.queue = queue_copy;
-                snag.drawer_open = true;
+            let mut newly_exiting: Vec<NodeId> = explorer_display_items_untracked(&tree)
+                .into_iter()
+                .filter(|&id| {
+                    tree.node(id)
+                        .is_some_and(|candidate| candidate.relative_path.starts_with(&rel))
+                })
+                .collect();
+            if !newly_exiting.contains(&node_id) {
+                newly_exiting.push(node_id);
+            }
+
+            let exiting_batch = newly_exiting.clone();
+            batch(|| {
+                exiting_signal().update(|exiting| {
+                    exiting.nodes.extend(exiting_batch);
+                });
+                snag_signal().update(|snag| {
+                    snag.queue = queue_copy;
+                    snag.drawer_open = true;
+                });
             });
+
             let msg = if consolidated_children > 0 {
                 format!(
                     "Snagged `{}` (consolidated {consolidated_children} child item(s))",
@@ -524,6 +653,26 @@ pub(crate) fn toggle_snag_node(node_id: NodeId) {
                 )
             };
             set_notice(NoticeTone::Info, msg);
+
+            spawn_app_task(async move {
+                timer(Duration::from_millis(270)).await;
+                let still_exiting = exiting_signal().with_untracked(|exiting| {
+                    newly_exiting.iter().any(|id| exiting.nodes.contains(id))
+                });
+                if !still_exiting {
+                    return;
+                }
+                animate_layout(LayoutAnimation {
+                    create: None,
+                    update: Some(LayoutTransition::new(LayoutCurve::EaseOut, 180.0)),
+                    delete: None,
+                });
+                exiting_signal().update(|exiting| {
+                    for id in &newly_exiting {
+                        exiting.nodes.remove(id);
+                    }
+                });
+            });
         }
         Ok(SnagOutcome::AlreadyCoveredByAncestor { ancestor }) => {
             set_notice(
@@ -539,6 +688,42 @@ pub(crate) fn toggle_snag_node(node_id: NodeId) {
             set_notice(NoticeTone::Danger, format!("Blocked by safety rail: {err}"));
         }
     }
+}
+
+/// Removes one item from the destruction queue and restores it smoothly into the explorer.
+pub(crate) fn unstage_item(relative_path: &Path) {
+    animate_layout(LayoutAnimation {
+        create: Some(LayoutTransition::new(LayoutCurve::EaseOut, 180.0)),
+        update: Some(LayoutTransition::new(LayoutCurve::EaseOut, 180.0)),
+        delete: None,
+    });
+    let active_tree = current_tree_untracked();
+    batch(|| {
+        if let Some(ref tree) = active_tree {
+            exiting_signal().update(|exiting| {
+                exiting.nodes.retain(|&id| {
+                    tree.node(id)
+                        .is_none_or(|node| !node.relative_path.starts_with(relative_path))
+                });
+            });
+        }
+        snag_signal().update(|snag| {
+            snag.queue.remove(relative_path);
+        });
+    });
+}
+
+/// Clears all items from the destruction queue and restores them into the explorer.
+pub(crate) fn clear_snag_queue() {
+    animate_layout(LayoutAnimation {
+        create: Some(LayoutTransition::new(LayoutCurve::EaseOut, 180.0)),
+        update: Some(LayoutTransition::new(LayoutCurve::EaseOut, 180.0)),
+        delete: None,
+    });
+    batch(|| {
+        exiting_signal().update(|exiting| exiting.nodes.clear());
+        snag_signal().update(|snag| snag.queue.clear());
+    });
 }
 
 pub(crate) fn quick_trash_node(node_id: NodeId) {
@@ -657,15 +842,18 @@ fn apply_destruction_report(
         }
     });
 
-    snag_signal().update(|snag| {
-        for rel in &succeeded_relatives {
-            snag.queue.remove(rel);
-        }
-        snag.running = false;
-        snag.confirm_open = false;
-        snag.erase_input.clear();
-        snag.progress = None;
-        snag.last_report = Some(report);
+    batch(|| {
+        exiting_signal().update(|exiting| exiting.nodes.clear());
+        snag_signal().update(|snag| {
+            for rel in &succeeded_relatives {
+                snag.queue.remove(rel);
+            }
+            snag.running = false;
+            snag.confirm_open = false;
+            snag.erase_input.clear();
+            snag.progress = None;
+            snag.last_report = Some(report);
+        });
     });
 
     if failed_count == 0 {

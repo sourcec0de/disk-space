@@ -57,20 +57,22 @@ pub(crate) fn shell() -> impl IntoElement {
                     &prog.current_path,
                 ),
                 ScanPhase::Failed(err) => failed_view(&err),
-                ScanPhase::Ready(tree) => ready_workspace(&tree),
+                ScanPhase::Ready(ref tree) => ready_workspace(tree),
             }
         }))
         .child(dynamic(snag_drawer::confirm_modal))
 }
 
 fn ready_workspace(tree: &Arc<StorageTree>) -> View {
+    let sidebar_tree = Arc::clone(tree);
+    let drawer_tree = Arc::clone(tree);
     view()
         .flex_1()
         .flex_row()
         .gap_4()
-        .child(sidebar::categories_sidebar(tree))
+        .child(dynamic(move || sidebar::categories_sidebar(&sidebar_tree)))
         .child(explorer::explorer_pane(tree))
-        .child(snag_drawer::snag_drawer(tree))
+        .child(dynamic(move || snag_drawer::snag_drawer(&drawer_tree)))
 }
 
 fn scanning_view(files: u64, dirs: u64, bytes: u64, path: &str) -> View {
@@ -469,7 +471,7 @@ fn register_shortcuts() {
     });
     on_key_with("s", nav_opts, |_| {
         if let Some(id) = selected_node_id() {
-            state::toggle_snag_node(id);
+            state::snag_node(id);
         }
     });
     on_key_with("f", nav_opts, |_| {

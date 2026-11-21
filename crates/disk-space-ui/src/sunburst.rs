@@ -11,12 +11,12 @@ use nsh_core::Bounds;
 use nsh_core::Points;
 use nsh_core::prelude::Cursor;
 use nsh_core::prelude::Interactive;
-use nsh_core::prelude::IntoElement;
 use nsh_core::prelude::MouseEvent;
 use nsh_core::prelude::Painter;
 use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::PressEvent;
 use nsh_core::prelude::Styled;
+use nsh_core::prelude::View;
 use nsh_core::prelude::canvas;
 use nsh_core::prelude::px;
 use nsh_core::prelude::signal;
@@ -210,7 +210,7 @@ fn render_sunburst(w: f32, h: f32) -> Painter {
 }
 
 /// Interactive radial sunburst panel for DaisyDisk-style visual drill-down.
-pub(crate) fn sunburst_panel(tree: &StorageTree) -> impl IntoElement {
+pub(crate) fn sunburst_panel(tree: &StorageTree) -> View {
     let canvas_size = signal((SUNBURST_SIZE, SUNBURST_SIZE));
     let browse = state::browse_signal().get();
     let center_node_id = browse.current_node.unwrap_or_else(|| tree.root_id());
@@ -289,11 +289,7 @@ pub(crate) fn sunburst_panel(tree: &StorageTree) -> impl IntoElement {
         .child(hovered_info)
 }
 
-fn sunburst_info_card(
-    center_name: &str,
-    center_bytes: u64,
-    can_ascend: bool,
-) -> nsh_core::prelude::View {
+fn sunburst_info_card(center_name: &str, center_bytes: u64, can_ascend: bool) -> View {
     view().flex_1().gap_2().justify_center().child(
         view()
             .p_4()
