@@ -149,14 +149,12 @@ enum HitResult {
     Outside,
 }
 
-fn render_sunburst(w: f32, h: f32) -> Painter {
+fn render_sunburst(w: f32, h: f32, current_node: Option<NodeId>) -> Painter {
     let Some(active_tree) = state::current_tree() else {
         return Painter::new();
     };
-    let browse_now = state::browse_signal().get();
-    let center_id = browse_now
-        .current_node
-        .unwrap_or_else(|| active_tree.root_id());
+    let hover_sunburst = state::hover_signal().with(|hover| hover.sunburst);
+    let center_id = current_node.unwrap_or_else(|| active_tree.root_id());
     let slices = collect_slices(&active_tree, center_id);
     let cx = w / 2.0;
     let cy = h / 2.0;
@@ -166,7 +164,7 @@ fn render_sunburst(w: f32, h: f32) -> Painter {
         let Some(node) = active_tree.node(slice.node_id) else {
             continue;
         };
-        let is_hovered = browse_now.hover_sunburst == Some(slice.node_id);
+        let is_hovered = hover_sunburst == Some(slice.node_id);
         let is_snagged =
             state::snag_signal().with(|snag| snag.queue.is_covered(&node.relative_path));
 
@@ -210,10 +208,9 @@ fn render_sunburst(w: f32, h: f32) -> Painter {
 }
 
 /// Interactive radial sunburst panel for DaisyDisk-style visual drill-down.
-pub(crate) fn sunburst_panel(tree: &StorageTree) -> View {
+pub(crate) fn sunburst_panel(tree: &StorageTree, current_node: Option<NodeId>) -> View {
     let canvas_size = signal((SUNBURST_SIZE, SUNBURST_SIZE));
-    let browse = state::browse_signal().get();
-    let center_node_id = browse.current_node.unwrap_or_else(|| tree.root_id());
+    let center_node_id = current_node.unwrap_or_else(|| tree.root_id());
     let center_name = tree
         .node(center_node_id)
         .map_or_else(|| "root".to_owned(), |node| node.name.clone());
@@ -222,7 +219,7 @@ pub(crate) fn sunburst_panel(tree: &StorageTree) -> View {
 
     let chart = canvas(move || {
         let (w, h) = canvas_size.get();
-        render_sunburst(w, h)
+        render_sunburst(w, h, current_node)
     })
     .w(px(SUNBURST_SIZE))
     .h(px(SUNBURST_SIZE))
@@ -250,10 +247,10 @@ pub(crate) fn sunburst_panel(tree: &StorageTree) -> View {
             HitResult::Slice(id) => Some(id),
             HitResult::CenterHub | HitResult::Outside => None,
         };
-        state::browse_signal().update(|b| b.hover_sunburst = next_hover);
+        state::hover_signal().update(|hover| hover.sunburst = next_hover);
     })
     .on_mouse_leave(move |_: &MouseEvent| {
-        state::browse_signal().update(|b| b.hover_sunburst = None);
+        state::hover_signal().update(|hover| hover.sunburst = None);
     })
     .on_press(move |event: &PressEvent| {
         let Some(active_tree) = state::current_tree_untracked() else {
@@ -317,7 +314,7 @@ fn sunburst_info_card(center_name: &str, center_bytes: u64, can_ascend: bool) ->
                     let Some(active_tree) = state::current_tree() else {
                         return String::new();
                     };
-                    let hov = state::browse_signal().with(|b| b.hover_sunburst);
+                    let hov = state::hover_signal().with(|h| h.sunburst);
                     hov.and_then(|id| active_tree.node(id)).map_or_else(
                         || "hover a ring arc to inspect · click arc to drill down".to_owned(),
                         |node| {

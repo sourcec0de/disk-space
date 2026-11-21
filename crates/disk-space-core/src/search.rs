@@ -6,11 +6,12 @@ use std::path::Path;
 use disk_space_platform::EntryKind;
 use disk_space_platform::StorageCategory;
 
+use crate::tree::DiskNode;
 use crate::tree::NodeId;
 use crate::tree::StorageTree;
 
 /// Maximum search hits returned to keep the UI responsive on massive trees.
-const MAX_SEARCH_RESULTS: usize = 400;
+pub const MAX_SEARCH_RESULTS: usize = 400;
 
 /// Filter toggle for showing all items vs. only junk/unused items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -80,67 +81,127 @@ pub struct AggregateReport {
     pub junk_clusters: Vec<NodeId>,
 }
 
-/// Searches `tree` according to `query` and returns matching [`NodeId`]s.
+/// Searches `tree` according to `query` and returns up to [`MAX_SEARCH_RESULTS`] sorted [`NodeId`]s.
 #[must_use]
 pub fn search_tree(tree: &StorageTree, query: &SearchQuery) -> Vec<NodeId> {
-    let trimmed = query.text.trim().to_ascii_lowercase();
+    let mut matches = search_tree_all(tree, query, None);
+    truncate_and_sort_nodes(tree, &mut matches, query.sort, MAX_SEARCH_RESULTS);
+    matches
+}
+
+/// Searches `tree` (or an explicit slice of `candidates`) according to `query` and returns all
+/// matching [`NodeId`]s without sorting or truncation.
+#[must_use]
+pub fn search_tree_all(
+    tree: &StorageTree,
+    query: &SearchQuery,
+    candidates: Option<&[NodeId]>,
+) -> Vec<NodeId> {
+    let normalized = NormalizedQuery::new(&query.text);
+    let filter = normalized.filter();
     let scope_prefix = query
         .scope_node
         .and_then(|id| tree.node(id))
         .map(|node| node.relative_path.as_path());
+    let root_id = tree.root_id();
 
-    let mut matches: Vec<NodeId> = tree
-        .active_nodes()
-        .filter(|node| node.id != tree.root_id())
-        .filter(|node| match scope_prefix {
-            Some(prefix) if !prefix.as_os_str().is_empty() => {
-                node.relative_path.starts_with(prefix) && node.relative_path.as_path() != prefix
+    let matches_criteria = |node: &DiskNode| -> bool {
+        if node.id == root_id {
+            return false;
+        }
+        if let Some(prefix) = scope_prefix
+            && !prefix.as_os_str().is_empty()
+            && !(node.relative_path.starts_with(prefix) && node.relative_path.as_path() != prefix)
+        {
+            return false;
+        }
+        if query
+            .category
+            .is_some_and(|cat| node.category != cat && node.category_totals.get(cat) == 0)
+        {
+            return false;
+        }
+        match query.filter_mode {
+            FilterMode::All => {}
+            FilterMode::JunkAndUnusedOnly => {
+                if node.junk_kind.is_none() && node.unused_bytes == 0 {
+                    return false;
+                }
             }
-            _ => true,
-        })
-        .filter(|node| {
-            query
-                .category
-                .is_none_or(|cat| node.category == cat || node.category_totals.get(cat) > 0)
-        })
-        .filter(|node| match query.filter_mode {
-            FilterMode::All => true,
-            FilterMode::JunkAndUnusedOnly => node.junk_kind.is_some() || node.unused_bytes > 0,
-        })
-        .filter(|node| query.min_bytes.is_none_or(|min| node.total_bytes >= min))
-        .filter(|node| matches_text(node.name.as_str(), &node.relative_path, &trimmed))
-        .map(|node| node.id)
-        .collect();
+        }
+        if query.min_bytes.is_some_and(|min| node.total_bytes < min) {
+            return false;
+        }
+        matches_parsed(node, filter)
+    };
 
-    sort_nodes(tree, &mut matches, query.sort);
-    matches.truncate(MAX_SEARCH_RESULTS);
-    matches
+    candidates.map_or_else(
+        || {
+            tree.active_nodes()
+                .filter(|node| matches_criteria(node))
+                .map(|node| node.id)
+                .collect()
+        },
+        |ids| {
+            ids.iter()
+                .filter_map(|id| tree.node(*id))
+                .filter(|node| matches_criteria(node))
+                .map(|node| node.id)
+                .collect()
+        },
+    )
+}
+
+/// Keeps at most `limit` top [`NodeId`]s ordered by `order` using `select_nth_unstable_by`
+/// so large hit sets are partially partitioned in linear time before sorting the visible slice.
+pub fn truncate_and_sort_nodes(
+    tree: &StorageTree,
+    ids: &mut Vec<NodeId>,
+    order: SortOrder,
+    limit: usize,
+) {
+    if limit == 0 {
+        ids.clear();
+        return;
+    }
+    if ids.len() > limit {
+        ids.select_nth_unstable_by(limit, |&a, &b| compare_nodes(tree, a, b, order));
+        ids.truncate(limit);
+    }
+    ids.sort_by(|&a, &b| compare_nodes(tree, a, b, order));
 }
 
 /// Sorts a slice of [`NodeId`]s according to `order`.
 pub fn sort_nodes(tree: &StorageTree, ids: &mut [NodeId], order: SortOrder) {
-    ids.sort_by(|a_id, b_id| {
-        let Some(a) = tree.node(*a_id) else {
-            return std::cmp::Ordering::Greater;
-        };
-        let Some(b) = tree.node(*b_id) else {
-            return std::cmp::Ordering::Less;
-        };
-        match order {
-            SortOrder::SizeDesc => b
-                .total_bytes
-                .cmp(&a.total_bytes)
-                .then_with(|| a.name.cmp(&b.name)),
-            SortOrder::AgeOldestFirst => a
-                .modified
-                .cmp(&b.modified)
-                .then_with(|| b.total_bytes.cmp(&a.total_bytes)),
-            SortOrder::NameAsc => a
-                .name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase()),
-        }
-    });
+    ids.sort_by(|&a, &b| compare_nodes(tree, a, b, order));
+}
+
+fn compare_nodes(
+    tree: &StorageTree,
+    a_id: NodeId,
+    b_id: NodeId,
+    order: SortOrder,
+) -> std::cmp::Ordering {
+    let Some(a) = tree.node(a_id) else {
+        return std::cmp::Ordering::Greater;
+    };
+    let Some(b) = tree.node(b_id) else {
+        return std::cmp::Ordering::Less;
+    };
+    match order {
+        SortOrder::SizeDesc => b
+            .total_bytes
+            .cmp(&a.total_bytes)
+            .then_with(|| a.name.cmp(&b.name)),
+        SortOrder::AgeOldestFirst => a
+            .modified
+            .cmp(&b.modified)
+            .then_with(|| b.total_bytes.cmp(&a.total_bytes)),
+        SortOrder::NameAsc => a
+            .name_lower
+            .cmp(&b.name_lower)
+            .then_with(|| a.name.cmp(&b.name)),
+    }
 }
 
 /// Computes extension, top-folder, and junk-cluster aggregations within `scope`.
@@ -170,10 +231,10 @@ pub fn compute_aggregates(tree: &StorageTree, scope: NodeId, limit: usize) -> Ag
                 junk.push(node.id);
             }
         } else if node.kind == EntryKind::File {
-            let ext = Path::new(&node.name).extension().map_or_else(
-                || "(no ext)".to_owned(),
-                |e| e.to_string_lossy().to_ascii_lowercase(),
-            );
+            let ext = node
+                .ext_lower
+                .as_deref()
+                .map_or_else(|| "(no ext)".to_owned(), str::to_owned);
             let entry = ext_map
                 .entry(ext)
                 .or_insert((0, 0, node.id, node.own_bytes));
@@ -216,41 +277,67 @@ pub fn compute_aggregates(tree: &StorageTree, scope: NodeId, limit: usize) -> Ag
     }
 }
 
-fn matches_text(name: &str, relative_path: &Path, needle: &str) -> bool {
-    let trimmed = needle.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    if let Some(ext_query) = trimmed.strip_prefix('.')
-        && !ext_query.is_empty()
-        && !ext_query.contains('/')
-        && !ext_query.contains('\\')
-    {
-        return Path::new(name)
-            .extension()
-            .is_some_and(|ext| ext.to_string_lossy().to_ascii_lowercase() == ext_query);
+#[derive(Clone, Copy)]
+enum QueryFilter<'a> {
+    Empty,
+    Extension(&'a str),
+    Name(&'a str),
+    Subpath(&'a str),
+}
+
+struct NormalizedQuery {
+    normalized: String,
+}
+
+impl NormalizedQuery {
+    fn new(text: &str) -> Self {
+        let trimmed = text.trim();
+        let normalized = if trimmed.contains('\\') {
+            trimmed.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            trimmed.to_ascii_lowercase()
+        };
+        Self { normalized }
     }
 
-    let normalized = trimmed.replace('\\', "/");
-    let clean = normalized.trim_matches('/');
-    if clean.is_empty() {
-        return true;
+    fn filter(&self) -> QueryFilter<'_> {
+        let trimmed = self.normalized.trim();
+        if trimmed.is_empty() {
+            return QueryFilter::Empty;
+        }
+        if let Some(ext_query) = trimmed.strip_prefix('.')
+            && !ext_query.is_empty()
+            && !ext_query.contains('/')
+        {
+            return QueryFilter::Extension(ext_query);
+        }
+        let clean = trimmed.trim_matches('/');
+        if clean.is_empty() {
+            QueryFilter::Empty
+        } else if clean.contains('/') {
+            QueryFilter::Subpath(clean)
+        } else {
+            QueryFilter::Name(clean)
+        }
     }
+}
 
-    let name_lower = name.to_ascii_lowercase();
-    if !clean.contains('/') {
-        return name_lower.contains(clean);
+fn matches_parsed(node: &DiskNode, filter: QueryFilter<'_>) -> bool {
+    match filter {
+        QueryFilter::Empty => true,
+        QueryFilter::Extension(ext_query) => node.ext_lower.as_deref() == Some(ext_query),
+        QueryFilter::Name(clean) => node.name_lower.contains(clean),
+        QueryFilter::Subpath(clean) => {
+            // Explicit subpath queries must extend into the entry's own name, never match only an ancestor.
+            let name_start = node
+                .rel_path_lower
+                .len()
+                .saturating_sub(node.name_lower.len());
+            node.rel_path_lower
+                .rfind(clean)
+                .is_some_and(|pos| pos.saturating_add(clean.len()) > name_start)
+        }
     }
-
-    // Explicit subpath queries must extend into the entry's own name, never match only an ancestor.
-    let rel_norm = relative_path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let name_start = rel_norm.len().saturating_sub(name_lower.len());
-    rel_norm
-        .rfind(clean)
-        .is_some_and(|pos| pos.saturating_add(clean.len()) > name_start)
 }
 
 #[cfg(test)]
@@ -395,5 +482,86 @@ mod tests {
             .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
             .collect();
         assert_eq!(subpath_names, vec!["data"]);
+    }
+
+    #[test]
+    fn incremental_candidate_narrowing_matches_full_search() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let root_dir = outer.path().join("downloads");
+        let dir = root_dir.join("playwright-report-core");
+        fs::create_dir_all(&dir).expect("mkdir");
+        fs::write(dir.join("playwright-trace.zip"), vec![1_u8; 4_096]).expect("write trace");
+        fs::write(root_dir.join("playground.txt"), vec![2_u8; 2_048]).expect("write playground");
+        fs::write(root_dir.join("other.bin"), vec![3_u8; 8_192]).expect("write other");
+
+        let host = FakePlatform::new(root_dir.clone());
+        let scan_root_val = ScanRoot::new(&root_dir, &host).expect("scan root");
+        let tree = scan_root(
+            scan_root_val,
+            &host,
+            &ScanOptions::default(),
+            &ScanCancelHandle::new(),
+            &mut |_| {},
+        )
+        .expect("scan");
+
+        let broad_query = SearchQuery {
+            text: "play".to_owned(),
+            ..SearchQuery::default()
+        };
+        let broad = search_tree_all(&tree, &broad_query, None);
+        assert_eq!(broad.len(), 3);
+
+        let narrow_query = SearchQuery {
+            text: "playwright".to_owned(),
+            ..SearchQuery::default()
+        };
+        let mut from_candidates = search_tree_all(&tree, &narrow_query, Some(&broad));
+        let full = search_tree(&tree, &narrow_query);
+        truncate_and_sort_nodes(
+            &tree,
+            &mut from_candidates,
+            SortOrder::SizeDesc,
+            MAX_SEARCH_RESULTS,
+        );
+        assert_eq!(from_candidates, full);
+    }
+
+    #[test]
+    fn truncate_and_sort_nodes_keeps_exact_top_n() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let root_dir = outer.path().join("many");
+        fs::create_dir_all(&root_dir).expect("mkdir");
+        for idx in 1..=12_u64 {
+            let size = usize::try_from(idx * 16_384).expect("size fits");
+            fs::write(
+                root_dir.join(format!("item_{idx:02}.dat")),
+                vec![0_u8; size],
+            )
+            .expect("write file");
+        }
+
+        let host = FakePlatform::new(root_dir.clone());
+        let scan_root_val = ScanRoot::new(&root_dir, &host).expect("scan root");
+        let tree = scan_root(
+            scan_root_val,
+            &host,
+            &ScanOptions::default(),
+            &ScanCancelHandle::new(),
+            &mut |_| {},
+        )
+        .expect("scan");
+
+        let mut ids = search_tree_all(&tree, &SearchQuery::default(), None);
+        assert_eq!(ids.len(), 12);
+        truncate_and_sort_nodes(&tree, &mut ids, SortOrder::SizeDesc, 4);
+        let names: Vec<&str> = ids
+            .iter()
+            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["item_12.dat", "item_11.dat", "item_10.dat", "item_09.dat"]
+        );
     }
 }

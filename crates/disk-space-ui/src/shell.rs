@@ -15,6 +15,8 @@ use nsh_core::prelude::KeyOptions;
 use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::Styled;
 use nsh_core::prelude::View;
+use nsh_core::prelude::batch;
+use nsh_core::prelude::computed;
 use nsh_core::prelude::dynamic;
 use nsh_core::prelude::on_key_with;
 use nsh_core::prelude::pick_paths;
@@ -66,11 +68,15 @@ pub(crate) fn shell() -> impl IntoElement {
 fn ready_workspace(tree: &Arc<StorageTree>) -> View {
     let sidebar_tree = Arc::clone(tree);
     let drawer_tree = Arc::clone(tree);
+    let selected_cat = computed(|| state::browse_signal().with(|b| b.selected_category));
     view()
         .flex_1()
+        .min_h(px(0.0))
         .flex_row()
         .gap_4()
-        .child(dynamic(move || sidebar::categories_sidebar(&sidebar_tree)))
+        .child(dynamic(move || {
+            sidebar::categories_sidebar(&sidebar_tree, selected_cat.get())
+        }))
         .child(explorer::explorer_pane(tree))
         .child(dynamic(move || snag_drawer::snag_drawer(&drawer_tree)))
 }
@@ -438,55 +444,26 @@ fn open_root_picker() {
 }
 
 fn register_shortcuts() {
-    let nav_opts = KeyOptions {
+    let app_opts = KeyOptions {
         when: When::NotEditing,
         ..KeyOptions::default()
     };
 
-    for key in ["down", "j"] {
-        on_key_with(key, nav_opts, |_| move_selection(1));
-    }
-    for key in ["up", "k"] {
-        on_key_with(key, nav_opts, |_| move_selection(-1));
-    }
-    for key in ["right", "enter"] {
-        on_key_with(key, nav_opts, |_| {
-            if let Some(id) = selected_node_id() {
-                state::open_node(id);
-            }
-        });
-    }
-    for key in ["left", "h", "backspace"] {
-        on_key_with(key, nav_opts, |_| state::ascend_directory());
-    }
-    on_key_with("g", nav_opts, |_| {
-        if let Some(id) = selected_node_id() {
-            state::jump_to_culprit(id);
-        }
-    });
-    on_key_with("o", nav_opts, |_| {
-        if let Some(id) = selected_node_id() {
-            state::reveal_node(id);
-        }
-    });
-    on_key_with("s", nav_opts, |_| {
-        if let Some(id) = selected_node_id() {
-            state::snag_node(id);
-        }
-    });
-    on_key_with("f", nav_opts, |_| {
-        state::browse_signal().update(|b| {
-            b.filter_mode = match b.filter_mode {
-                FilterMode::All => FilterMode::JunkAndUnusedOnly,
-                FilterMode::JunkAndUnusedOnly | _ => FilterMode::All,
-            };
-            b.selected_row = 0;
+    on_key_with("f", app_opts, |_| {
+        batch(|| {
+            state::browse_signal().update(|b| {
+                b.filter_mode = match b.filter_mode {
+                    FilterMode::All => FilterMode::JunkAndUnusedOnly,
+                    FilterMode::JunkAndUnusedOnly | _ => FilterMode::All,
+                };
+            });
+            state::selection_signal().update(state::SelectionState::clear);
         });
     });
-    on_key_with("d", nav_opts, |_| {
+    on_key_with("d", app_opts, |_| {
         state::snag_signal().update(|s| s.drawer_open = !s.drawer_open);
     });
-    on_key_with("v", nav_opts, |_| {
+    on_key_with("v", app_opts, |_| {
         state::browse_signal().update(|b| {
             b.view_tab = match b.view_tab {
                 ViewTab::DotMatrix => ViewTab::Sunburst,
@@ -495,7 +472,7 @@ fn register_shortcuts() {
             };
         });
     });
-    on_key_with("r", nav_opts, |_| {
+    on_key_with("r", app_opts, |_| {
         if let Some(root) = state::scan_signal().with_untracked(|s| s.root_path.clone()) {
             state::start_scan(root);
         }
@@ -516,43 +493,22 @@ fn register_shortcuts() {
                 });
                 return;
             }
+            let has_multi = state::selection_signal().with_untracked(|sel| sel.selected.len() > 1);
+            if has_multi {
+                state::selection_signal().update(state::SelectionState::collapse_to_cursor);
+                return;
+            }
             let has_search = state::browse_signal().with_untracked(|b| !b.search_text.is_empty());
             if has_search {
-                state::browse_signal().update(|b| {
-                    b.search_text.clear();
-                    b.selected_row = 0;
+                batch(|| {
+                    state::browse_signal().update(|b| {
+                        b.search_text.clear();
+                    });
+                    state::selection_signal().update(state::SelectionState::clear);
                 });
                 return;
             }
             state::ascend_directory();
         },
     );
-}
-
-fn move_selection(delta: isize) {
-    let Some(tree) = state::current_tree_untracked() else {
-        return;
-    };
-    let count = state::visible_items(&tree).len();
-    if count == 0 {
-        return;
-    }
-    state::browse_signal().update(|b| {
-        let cur = b.selected_row.min(count - 1);
-        if delta < 0 {
-            b.selected_row = cur.saturating_sub(delta.unsigned_abs());
-        } else {
-            b.selected_row = cur.saturating_add(delta.cast_unsigned()).min(count - 1);
-        }
-    });
-}
-
-fn selected_node_id() -> Option<disk_space_core::NodeId> {
-    let tree = state::current_tree_untracked()?;
-    let items = state::visible_items(&tree);
-    if items.is_empty() {
-        return None;
-    }
-    let idx = state::browse_signal().with_untracked(|b| b.selected_row.min(items.len() - 1));
-    items.get(idx).copied()
 }

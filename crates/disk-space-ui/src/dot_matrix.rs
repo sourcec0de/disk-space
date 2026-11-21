@@ -16,6 +16,7 @@ use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::PressEvent;
 use nsh_core::prelude::Styled;
 use nsh_core::prelude::canvas;
+use nsh_core::prelude::computed;
 use nsh_core::prelude::px;
 use nsh_core::prelude::signal;
 use nsh_core::prelude::text;
@@ -194,7 +195,12 @@ fn column_at_x(width: f32, x: f32, col_count: usize) -> Option<usize> {
     clippy::cast_precision_loss,
     reason = "dot grid converts layout point coordinates to discrete columns and rows"
 )]
-fn render_dot_matrix(w: f32) -> Painter {
+fn render_dot_matrix(
+    w: f32,
+    selected_category: Option<StorageCategory>,
+    hover_category: Option<StorageCategory>,
+    staged_bytes: u64,
+) -> Painter {
     if w <= 10.0 {
         return Painter::new();
     }
@@ -202,8 +208,6 @@ fn render_dot_matrix(w: f32) -> Painter {
         return draw_idle_dots(w);
     };
 
-    let browse = state::browse_signal().get();
-    let staged_bytes = state::snag_signal().with(|snag| snag.queue.total_bytes());
     let total_cols = ((w - 4.0) / DOT_PITCH).floor().max(1.0) as usize;
     let columns = build_columns(&tree, total_cols, staged_bytes);
     let oy = (MATRIX_ROWS_F32 - 1.0).mul_add(-DOT_PITCH, CANVAS_HEIGHT) / 2.0;
@@ -211,11 +215,7 @@ fn render_dot_matrix(w: f32) -> Painter {
     let mut painter = Painter::new();
     for (col_idx, col) in columns.iter().enumerate() {
         let cx = (col_idx as f32).mul_add(DOT_PITCH, 4.0);
-        let is_dimmed = match (
-            browse.selected_category,
-            browse.hover_category,
-            col.category,
-        ) {
+        let is_dimmed = match (selected_category, hover_category, col.category) {
             (Some(sel), _, Some(cat)) => sel != cat,
             (None, Some(hov), Some(cat)) => hov != cat,
             _ => false,
@@ -245,65 +245,75 @@ fn render_dot_matrix(w: f32) -> Painter {
 /// Interactive dot-matrix disk map section.
 pub(crate) fn dot_matrix_bar() -> impl IntoElement {
     let width = signal(0.0_f32);
+    let selected_cat = computed(|| state::browse_signal().with(|b| b.selected_category));
+    let staged_bytes = computed(|| state::snag_signal().with(|s| s.queue.total_bytes()));
 
-    let matrix_canvas = canvas(move || render_dot_matrix(width.get()))
-        .h(px(CANVAS_HEIGHT))
-        .w_full()
-        .cursor(Cursor::Pointer)
-        .on_layout(move |frame: &Bounds<Points>| width.set(frame.size.width.0))
-        .on_mouse_move(move |event: &MouseEvent| {
-            let Some(tree) = state::current_tree_untracked() else {
-                return;
-            };
-            let w = width.get_untracked();
-            let staged = state::snag_signal().with_untracked(|snag| snag.queue.total_bytes());
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "width converted to column count"
-            )]
-            let total_cols = ((w - 4.0) / DOT_PITCH).floor().max(1.0) as usize;
-            let columns = build_columns(&tree, total_cols, staged);
-            if let Some(col_idx) = column_at_x(w, event.position.x.0, columns.len()) {
-                let hovered = columns[col_idx].category;
-                state::browse_signal().update(|browse| browse.hover_category = hovered);
+    let matrix_canvas = canvas(move || {
+        let hover_cat = state::hover_signal().with(|h| h.category);
+        render_dot_matrix(
+            width.get(),
+            selected_cat.get(),
+            hover_cat,
+            staged_bytes.get(),
+        )
+    })
+    .h(px(CANVAS_HEIGHT))
+    .w_full()
+    .cursor(Cursor::Pointer)
+    .on_layout(move |frame: &Bounds<Points>| width.set(frame.size.width.0))
+    .on_mouse_move(move |event: &MouseEvent| {
+        let Some(tree) = state::current_tree_untracked() else {
+            return;
+        };
+        let w = width.get_untracked();
+        let staged = state::snag_signal().with_untracked(|snag| snag.queue.total_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "width converted to column count"
+        )]
+        let total_cols = ((w - 4.0) / DOT_PITCH).floor().max(1.0) as usize;
+        let columns = build_columns(&tree, total_cols, staged);
+        if let Some(col_idx) = column_at_x(w, event.position.x.0, columns.len()) {
+            let hovered = columns[col_idx].category;
+            state::hover_signal().update(|hover| hover.category = hovered);
+        }
+    })
+    .on_mouse_leave(move |_: &MouseEvent| {
+        state::hover_signal().update(|hover| hover.category = None);
+    })
+    .on_press(move |event: &PressEvent| {
+        let Some(tree) = state::current_tree_untracked() else {
+            return;
+        };
+        let w = width.get_untracked();
+        let staged = state::snag_signal().with_untracked(|snag| snag.queue.total_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "width converted to column count"
+        )]
+        let total_cols = ((w - 4.0) / DOT_PITCH).floor().max(1.0) as usize;
+        let columns = build_columns(&tree, total_cols, staged);
+        if let Some(col_idx) = column_at_x(w, event.position.x.0, columns.len())
+            && let Some(cat) = columns[col_idx].category
+        {
+            let currently_selected =
+                state::browse_signal().with_untracked(|browse| browse.selected_category);
+            if currently_selected == Some(cat) {
+                state::select_category(None);
+            } else {
+                state::select_category(Some(cat));
             }
-        })
-        .on_mouse_leave(move |_: &MouseEvent| {
-            state::browse_signal().update(|browse| browse.hover_category = None);
-        })
-        .on_press(move |event: &PressEvent| {
-            let Some(tree) = state::current_tree_untracked() else {
-                return;
-            };
-            let w = width.get_untracked();
-            let staged = state::snag_signal().with_untracked(|snag| snag.queue.total_bytes());
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "width converted to column count"
-            )]
-            let total_cols = ((w - 4.0) / DOT_PITCH).floor().max(1.0) as usize;
-            let columns = build_columns(&tree, total_cols, staged);
-            if let Some(col_idx) = column_at_x(w, event.position.x.0, columns.len())
-                && let Some(cat) = columns[col_idx].category
-            {
-                let currently_selected =
-                    state::browse_signal().with_untracked(|browse| browse.selected_category);
-                if currently_selected == Some(cat) {
-                    state::select_category(None);
-                } else {
-                    state::select_category(Some(cat));
-                }
-            }
-        });
+        }
+    });
 
     let hover_caption = text(move || {
         let Some(tree) = state::current_tree() else {
             return String::new();
         };
-        let browse = state::browse_signal().get();
-        let active = browse.hover_category.or(browse.selected_category);
+        let hover_cat = state::hover_signal().with(|h| h.category);
+        let active = hover_cat.or_else(|| selected_cat.get());
         active.map_or_else(
             || "click any category segment to isolate it".to_owned(),
             |cat| {

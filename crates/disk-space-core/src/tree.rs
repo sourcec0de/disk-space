@@ -120,6 +120,12 @@ pub struct DiskNode {
     pub children: Vec<NodeId>,
     /// Base filename or directory name.
     pub name: String,
+    /// Pre-folded lowercase filename or directory name for search/sorting.
+    pub(crate) name_lower: String,
+    /// Pre-folded lowercase file extension without leading dot, if any.
+    pub(crate) ext_lower: Option<String>,
+    /// Pre-folded slash-normalized lowercase relative path.
+    pub(crate) rel_path_lower: String,
     /// Relative path from [`StorageTree::root`].
     pub relative_path: PathBuf,
     /// Entry kind (`File`, `Directory`, `Symlink`, `Other`).
@@ -194,6 +200,7 @@ impl StorageTree {
             hardlink_savings_bytes,
             scanned_at,
         };
+        tree.populate_search_fields();
         tree.recompute_aggregates();
         tree
     }
@@ -373,6 +380,20 @@ impl StorageTree {
                 stack.extend(node.children.iter().copied());
                 node.children.clear();
             }
+        }
+    }
+
+    fn populate_search_fields(&mut self) {
+        for node in &mut self.nodes {
+            node.name_lower = node.name.to_ascii_lowercase();
+            node.ext_lower = Path::new(&node.name)
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_ascii_lowercase());
+            node.rel_path_lower = node
+                .relative_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
         }
     }
 

@@ -1,4 +1,4 @@
-//! Main explorer pane: breadcrumbs, search & junk filters, item rows, and aggregates.
+//! Main explorer pane: breadcrumbs, search & junk filters, virtualized accessible listbox, and aggregates.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -16,79 +16,545 @@ use disk_space_core::format_age;
 use disk_space_core::format_bytes;
 use disk_space_platform::EntryKind;
 use disk_space_platform::StorageCategory;
+use nsh_base::ButtonElement;
 use nsh_base::button;
 use nsh_base::input;
+use nsh_core::keymap::When;
+use nsh_core::prelude::AccessibilityRole;
+use nsh_core::prelude::AccessibilityState;
 use nsh_core::prelude::Accessible;
 use nsh_core::prelude::ComponentBuilder;
+use nsh_core::prelude::Composition;
 use nsh_core::prelude::Cursor;
 use nsh_core::prelude::Easing;
 use nsh_core::prelude::Element;
+use nsh_core::prelude::ElementRef;
 use nsh_core::prelude::FontWeight;
+use nsh_core::prelude::Interactive;
 use nsh_core::prelude::IntoElement;
+use nsh_core::prelude::KeyOptions;
 use nsh_core::prelude::Keyframe;
 use nsh_core::prelude::KeyframeTiming;
+use nsh_core::prelude::ListLayout;
+use nsh_core::prelude::Memo;
 use nsh_core::prelude::MotionChannel;
 use nsh_core::prelude::MotionSpec;
 use nsh_core::prelude::ParentElement;
-use nsh_core::prelude::ReadSignal;
+use nsh_core::prelude::Percentage;
+use nsh_core::prelude::PointerEvents;
+use nsh_core::prelude::Position;
+use nsh_core::prelude::PressEvent;
+use nsh_core::prelude::Signal;
 use nsh_core::prelude::Styled;
 use nsh_core::prelude::View;
+use nsh_core::prelude::ViewableItems;
+use nsh_core::prelude::announce_for_accessibility;
+use nsh_core::prelude::batch;
 use nsh_core::prelude::computed;
 use nsh_core::prelude::dynamic;
-use nsh_core::prelude::each;
 use nsh_core::prelude::effect;
+use nsh_core::prelude::element_ref;
 use nsh_core::prelude::motion;
+use nsh_core::prelude::on_key_with;
 use nsh_core::prelude::px;
+use nsh_core::prelude::reads_active_descendants;
+use nsh_core::prelude::rgba;
+use nsh_core::prelude::screen_reader;
 use nsh_core::prelude::scroll;
+use nsh_core::prelude::signal;
 use nsh_core::prelude::text;
+use nsh_core::prelude::untracked;
 use nsh_core::prelude::view;
+use nsh_core::prelude::virtual_list;
 use nsh_core::prelude::when;
 
 use crate::palette;
 use crate::state;
 use crate::state::AggregateKind;
+use crate::state::ListMove;
+use crate::state::SelectionState;
 use crate::state::ViewTab;
 use crate::sunburst;
 
+const DEFAULT_PAGE_ROWS: usize = 10;
+
+/// Controller owning the explorer's memoized list model, focus refs, and keyboard actions.
+#[derive(Clone)]
+struct ExplorerController {
+    tree: Arc<StorageTree>,
+    data: state::ExplorerListData,
+    scope_node: Memo<Option<NodeId>>,
+    is_searching: Memo<bool>,
+    scope_bytes: Memo<u64>,
+    multi_selected: Memo<bool>,
+    search_ref: ElementRef,
+    listbox_ref: ElementRef,
+    list_ref: ElementRef,
+    search_focused: Signal<bool>,
+    list_focused: Signal<bool>,
+    active_row: Signal<Option<(NodeId, ElementRef)>>,
+    viewable_range: Rc<Cell<Option<(usize, usize)>>>,
+}
+
+impl ExplorerController {
+    fn new(tree: Arc<StorageTree>) -> Self {
+        let data = state::ExplorerListData::new(Arc::clone(&tree));
+        let scope_node = computed(|| state::browse_signal().with(|b| b.current_node));
+        let is_searching =
+            computed(|| state::browse_signal().with(|b| !b.search_text.trim().is_empty()));
+        let scope_tree = Arc::clone(&tree);
+        let scope_bytes = computed(move || state::current_scope_bytes(&scope_tree));
+        let multi_selected =
+            computed(|| state::selection_signal().with(|sel| sel.selected.len() > 1));
+
+        // Reconcile cursor & selection whenever the visible item set changes or selection was cleared.
+        let visible_watch = data.visible_items;
+        let no_cursor = computed(|| state::selection_signal().with(|sel| sel.cursor.is_none()));
+        effect(move || {
+            let _missing = no_cursor.get();
+            visible_watch.with(|visible| {
+                untracked(|| {
+                    let prev = state::selection_signal().get_untracked();
+                    let mut next = prev.clone();
+                    next.reconcile(visible);
+                    if next != prev {
+                        state::selection_signal().set(next);
+                    }
+                });
+            });
+        });
+
+        Self {
+            tree,
+            data,
+            scope_node,
+            is_searching,
+            scope_bytes,
+            multi_selected,
+            search_ref: element_ref(),
+            listbox_ref: element_ref(),
+            list_ref: element_ref(),
+            search_focused: signal(false),
+            list_focused: signal(false),
+            active_row: signal(None),
+            viewable_range: Rc::new(Cell::new(None)),
+        }
+    }
+
+    fn active_row_ref(&self) -> Option<ElementRef> {
+        let cursor = state::selection_signal().with(|sel| sel.cursor)?;
+        self.active_row
+            .get()
+            .filter(|&(id, _)| id == cursor)
+            .map(|(_, r)| r)
+    }
+
+    fn page_size(&self) -> usize {
+        self.viewable_range
+            .get()
+            .map_or(DEFAULT_PAGE_ROWS, |(first, last)| {
+                last.saturating_sub(first).saturating_add(1)
+            })
+            .max(1)
+    }
+
+    fn reveal_index(&self, idx: usize) {
+        if let Some((first, last)) = self.viewable_range.get() {
+            if (first..=last).contains(&idx) {
+                return;
+            }
+            let pos = if idx < first {
+                Percentage(0.0)
+            } else {
+                Percentage(1.0)
+            };
+            if let Ok(index) = u32::try_from(idx) {
+                self.list_ref.scroll_to_index(index, pos, px(0.0), false);
+            }
+        } else if let Ok(index) = u32::try_from(idx) {
+            self.list_ref
+                .scroll_to_index(index, Percentage(0.0), px(0.0), false);
+        }
+    }
+
+    fn announce_cursor(&self, node_id: NodeId) {
+        if !untracked(screen_reader) || reads_active_descendants() {
+            return;
+        }
+        let Some(node) = self.tree.node(node_id) else {
+            return;
+        };
+        let count = state::selection_signal().with_untracked(|sel| sel.selected.len());
+        let msg = if count > 1 {
+            format!(
+                "{}, {}, {} selected",
+                node.name,
+                format_bytes(node.total_bytes),
+                count
+            )
+        } else {
+            format!("{}, {}", node.name, format_bytes(node.total_bytes))
+        };
+        announce_for_accessibility(msg);
+    }
+
+    fn enter_list_from_search(&self) {
+        self.search_ref.blur();
+        self.listbox_ref.focus();
+        self.data.visible_items.with_untracked(|visible| {
+            let Some(&first) = visible.first() else {
+                return;
+            };
+            let target = state::selection_signal().with_untracked(|sel| sel.cursor);
+            let idx = target
+                .and_then(|id| visible.iter().position(|&v| v == id))
+                .unwrap_or_else(|| {
+                    state::selection_signal().update(|sel| sel.select_single(first));
+                    0
+                });
+            self.reveal_index(idx);
+            if let Some(&id) = visible.get(idx) {
+                self.announce_cursor(id);
+            }
+        });
+    }
+
+    fn move_selection(&self, step: ListMove, extend: bool) {
+        self.data.visible_items.with_untracked(|visible| {
+            if visible.is_empty() {
+                return;
+            }
+            let mut next_idx = None;
+            state::selection_signal().update(|sel| {
+                next_idx = sel.move_cursor(visible, step, extend);
+            });
+            if !self.list_focused.get_untracked() {
+                self.listbox_ref.focus();
+            }
+            if let Some(idx) = next_idx {
+                self.reveal_index(idx);
+                if let Some(&id) = visible.get(idx) {
+                    self.announce_cursor(id);
+                }
+            }
+        });
+    }
+
+    fn select_range_to(&self, target: NodeId) {
+        self.data.visible_items.with_untracked(|visible| {
+            let mut idx = None;
+            state::selection_signal().update(|sel| {
+                idx = sel.select_range_to(visible, target);
+            });
+            if let Some(i) = idx {
+                self.reveal_index(i);
+            }
+        });
+    }
+
+    fn select_all(&self) {
+        self.data.visible_items.with_untracked(|visible| {
+            state::selection_signal().update(|sel| sel.select_all(visible));
+        });
+    }
+
+    fn snag_selected(&self) {
+        self.data.visible_items.with_untracked(|visible| {
+            let targets =
+                state::selection_signal().with_untracked(|sel| sel.selected_in_order(visible));
+            if targets.is_empty() {
+                return;
+            }
+            self.data.display_items.with_untracked(|display| {
+                state::snag_nodes_in_display(&targets, display);
+            });
+        });
+    }
+
+    fn cursor_node_id() -> Option<NodeId> {
+        state::selection_signal().with_untracked(|sel| sel.cursor)
+    }
+
+    fn focus_search(&self) {
+        self.search_ref.focus();
+    }
+}
+
+fn can_handle_list_keys() -> bool {
+    let modal_open = state::snag_signal().with_untracked(|s| s.confirm_open);
+    let in_aggregates =
+        state::browse_signal().with_untracked(|b| b.view_tab == ViewTab::Aggregates);
+    !modal_open && !in_aggregates
+}
+
+fn bind_list_shortcuts(ctrl: &ExplorerController) {
+    let search_ctrl = ctrl.clone();
+    effect(move || {
+        if !search_ctrl.search_focused.get() {
+            return;
+        }
+        let enter_ctrl = search_ctrl.clone();
+        on_key_with(
+            "down",
+            KeyOptions {
+                when: When::Always,
+                repeat: false,
+                for_focus: true,
+                ..KeyOptions::default()
+            },
+            move |_| {
+                if !state::snag_signal().with_untracked(|s| s.confirm_open) {
+                    enter_ctrl.enter_list_from_search();
+                }
+            },
+        );
+        let esc_ctrl = search_ctrl.clone();
+        on_key_with(
+            "escape",
+            KeyOptions {
+                when: When::Always,
+                repeat: false,
+                for_focus: true,
+                ..KeyOptions::default()
+            },
+            move |_| {
+                let has_query =
+                    state::browse_signal().with_untracked(|b| !b.search_text.is_empty());
+                if has_query {
+                    batch(|| {
+                        state::browse_signal().update(|b| b.search_text.clear());
+                        state::selection_signal().update(SelectionState::clear);
+                    });
+                } else {
+                    esc_ctrl.enter_list_from_search();
+                }
+            },
+        );
+    });
+
+    let list_focus = ctrl.list_focused;
+    effect(move || {
+        let focused = list_focus.get();
+        if !focused {
+            return;
+        }
+        on_key_with(
+            "enter",
+            KeyOptions {
+                when: When::NotEditing,
+                repeat: false,
+                for_focus: true,
+                ..KeyOptions::default()
+            },
+            |_| {
+                if can_handle_list_keys()
+                    && let Some(id) = ExplorerController::cursor_node_id()
+                {
+                    state::open_node(id);
+                }
+            },
+        );
+    });
+
+    bind_motion_keys(ctrl);
+    bind_action_keys(ctrl);
+}
+
+fn bind_motion_keys(ctrl: &ExplorerController) {
+    let repeat_opts = KeyOptions {
+        when: When::NotEditing,
+        repeat: true,
+        ..KeyOptions::default()
+    };
+
+    for (key, step, extend) in [
+        ("down", ListMove::Down, false),
+        ("j", ListMove::Down, false),
+        ("up", ListMove::Up, false),
+        ("k", ListMove::Up, false),
+        ("shift+down", ListMove::Down, true),
+        ("shift+j", ListMove::Down, true),
+        ("shift+up", ListMove::Up, true),
+        ("shift+k", ListMove::Up, true),
+        ("home", ListMove::First, false),
+        ("end", ListMove::Last, false),
+        ("shift+home", ListMove::First, true),
+        ("shift+end", ListMove::Last, true),
+    ] {
+        let move_ctrl = ctrl.clone();
+        on_key_with(key, repeat_opts, move |_| {
+            if can_handle_list_keys() {
+                move_ctrl.move_selection(step, extend);
+            }
+        });
+    }
+
+    for (key, dir, extend) in [
+        ("pageup", -1_isize, false),
+        ("pagedown", 1_isize, false),
+        ("shift+pageup", -1_isize, true),
+        ("shift+pagedown", 1_isize, true),
+    ] {
+        let page_ctrl = ctrl.clone();
+        on_key_with(key, repeat_opts, move |_| {
+            if !can_handle_list_keys() {
+                return;
+            }
+            let page = page_ctrl.page_size();
+            let step = if dir < 0 {
+                ListMove::PageUp(page)
+            } else {
+                ListMove::PageDown(page)
+            };
+            page_ctrl.move_selection(step, extend);
+        });
+    }
+}
+
+fn bind_action_keys(ctrl: &ExplorerController) {
+    let once_opts = KeyOptions {
+        when: When::NotEditing,
+        repeat: false,
+        ..KeyOptions::default()
+    };
+
+    let select_all_ctrl = ctrl.clone();
+    on_key_with("mod+a", once_opts, move |_| {
+        if can_handle_list_keys() {
+            select_all_ctrl.select_all();
+        }
+    });
+
+    for key in ["s", "shift+s"] {
+        let snag_ctrl = ctrl.clone();
+        on_key_with(key, once_opts, move |_| {
+            if can_handle_list_keys() {
+                snag_ctrl.snag_selected();
+            }
+        });
+    }
+
+    for key in ["right", "enter"] {
+        on_key_with(key, once_opts, |_| {
+            if can_handle_list_keys()
+                && let Some(id) = ExplorerController::cursor_node_id()
+            {
+                state::open_node(id);
+            }
+        });
+    }
+    for key in ["left", "h", "backspace"] {
+        on_key_with(key, once_opts, |_| {
+            if can_handle_list_keys() {
+                state::ascend_directory();
+            }
+        });
+    }
+    on_key_with("g", once_opts, |_| {
+        if can_handle_list_keys()
+            && let Some(id) = ExplorerController::cursor_node_id()
+        {
+            state::jump_to_culprit(id);
+        }
+    });
+    on_key_with("o", once_opts, |_| {
+        if can_handle_list_keys()
+            && let Some(id) = ExplorerController::cursor_node_id()
+        {
+            state::reveal_node(id);
+        }
+    });
+
+    let slash_ctrl = ctrl.clone();
+    on_key_with("/", once_opts, move |_| {
+        if !state::snag_signal().with_untracked(|s| s.confirm_open) {
+            slash_ctrl.focus_search();
+        }
+    });
+    let find_ctrl = ctrl.clone();
+    on_key_with(
+        "mod+f",
+        KeyOptions {
+            when: When::Always,
+            repeat: false,
+            ..KeyOptions::default()
+        },
+        move |_| {
+            if !state::snag_signal().with_untracked(|s| s.confirm_open) {
+                find_ctrl.focus_search();
+            }
+        },
+    );
+}
+
 /// Renders the right detail pane (breadcrumbs, search/filter strip, rows or aggregates).
 pub(crate) fn explorer_pane(tree: &Arc<StorageTree>) -> impl IntoElement {
+    let ctrl = ExplorerController::new(Arc::clone(tree));
+    bind_list_shortcuts(&ctrl);
+
+    let header_key =
+        computed(|| state::browse_signal().with(|b| (b.current_node, b.selected_category)));
+    let filter_key = computed(|| {
+        state::browse_signal().with(|b| {
+            (
+                b.current_node,
+                b.selected_category,
+                b.filter_mode,
+                b.sort_order,
+            )
+        })
+    });
+    let active_tab = computed(|| state::browse_signal().with(|b| b.view_tab));
+
     let header_tree = Arc::clone(tree);
     let filter_tree = Arc::clone(tree);
-    let tab_tree = Arc::clone(tree);
-
-    let active_tab = computed(move || state::browse_signal().with(|b| b.view_tab));
+    let body_ctrl = ctrl.clone();
 
     let main_body = dynamic(move || {
         let tab = active_tab.get();
         match tab {
             ViewTab::Sunburst => {
-                let sun_tree = Arc::clone(&tab_tree);
+                let sun_tree = Arc::clone(&body_ctrl.tree);
+                let active_node = body_ctrl.scope_node;
                 view()
                     .flex_1()
+                    .min_h(px(0.0))
                     .gap_3()
-                    .child(dynamic(move || sunburst::sunburst_panel(&sun_tree)))
-                    .child(item_list_section(&tab_tree))
+                    .child(dynamic(move || {
+                        sunburst::sunburst_panel(&sun_tree, active_node.get())
+                    }))
+                    .child(item_list_section(&body_ctrl))
             }
-            ViewTab::Aggregates => aggregates_section(Arc::clone(&tab_tree)),
-            ViewTab::DotMatrix => item_list_section(&tab_tree),
+            ViewTab::Aggregates => aggregates_section(Arc::clone(&body_ctrl.tree)),
+            ViewTab::DotMatrix => item_list_section(&body_ctrl),
         }
     });
 
     view()
         .flex_1()
+        .min_h(px(0.0))
         .gap_3()
-        .child(dynamic(move || build_top_header(&header_tree)))
-        .child(build_search_bar())
-        .child(dynamic(move || build_filter_strip(&filter_tree)))
+        .child(dynamic(move || {
+            let (curr, cat) = header_key.get();
+            build_top_header(&header_tree, curr, cat)
+        }))
+        .child(build_search_bar(&ctrl))
+        .child(dynamic(move || {
+            let (curr, cat, filter_mode, sort_order) = filter_key.get();
+            build_filter_strip(&filter_tree, curr, cat, filter_mode, sort_order)
+        }))
         .child(main_body)
 }
 
-fn build_top_header(tree: &StorageTree) -> View {
-    let browse = state::browse_signal().get();
-    let header_node_id = browse.current_node.unwrap_or_else(|| tree.root_id());
+fn build_top_header(
+    tree: &StorageTree,
+    current_node: Option<NodeId>,
+    selected_category: Option<StorageCategory>,
+) -> View {
+    let header_node_id = current_node.unwrap_or_else(|| tree.root_id());
     let header_node = tree.node(header_node_id);
 
-    let (header_bytes, review_first) = match (browse.current_node, browse.selected_category) {
+    let (header_bytes, review_first) = match (current_node, selected_category) {
         (None, Some(cat)) => {
             let root_node = tree.node(tree.root_id());
             (root_node.map_or(0, |n| n.category_totals.get(cat)), false)
@@ -101,12 +567,11 @@ fn build_top_header(tree: &StorageTree) -> View {
 
     let vol_total = tree.volume().total_bytes.max(1);
     let pct_of_disk = header_bytes.saturating_mul(100) / vol_total;
-    let active_accent = browse
-        .selected_category
+    let active_accent = selected_category
         .or_else(|| header_node.map(|n| n.category))
         .map_or(palette::TEXT_PRIMARY, palette::category_color);
 
-    let subtitle_path = match (browse.current_node, browse.selected_category) {
+    let subtitle_path = match (current_node, selected_category) {
         (None, Some(cat)) => format!(
             "{} · {} category view",
             state::display_abs_path(tree.root().canonical_path()),
@@ -116,12 +581,7 @@ fn build_top_header(tree: &StorageTree) -> View {
         (None, None) => state::display_abs_path(tree.root().canonical_path()),
     };
 
-    let breadcrumbs = build_breadcrumbs(
-        tree,
-        browse.selected_category,
-        browse.current_node,
-        active_accent,
-    );
+    let breadcrumbs = build_breadcrumbs(tree, selected_category, current_node, active_accent);
 
     view()
         .gap_1()
@@ -184,7 +644,11 @@ fn header_metrics_group(header_bytes: u64, pct_of_disk: u64, review_first: bool)
         })
 }
 
-fn build_search_bar() -> View {
+fn build_search_bar(ctrl: &ExplorerController) -> View {
+    let composing = signal(false);
+    let search_focus = ctrl.search_focused;
+    let is_searching = ctrl.is_searching;
+
     view()
         .flex_row()
         .items_center()
@@ -192,14 +656,26 @@ fn build_search_bar() -> View {
         .child(
             input()
                 .label("Search storage")
+                .element_ref(&ctrl.search_ref)
+                .accessibility_controls(Some(ctrl.listbox_ref))
                 .value(move || state::browse_signal().with(|b| b.search_text.clone()))
+                .on_composition_change(move |comp: &Composition| {
+                    composing.set(comp.composing);
+                })
+                .on_focus(move || search_focus.set(true))
+                .on_blur(move || search_focus.set(false))
                 .on_change(move |value: &str| {
-                    state::browse_signal().update(|b| {
-                        value.clone_into(&mut b.search_text);
-                        b.selected_row = 0;
+                    if composing.get_untracked() {
+                        return;
+                    }
+                    batch(|| {
+                        state::browse_signal().update(|b| {
+                            value.clone_into(&mut b.search_text);
+                        });
+                        state::selection_signal().update(SelectionState::clear);
                     });
                 })
-                .placeholder("/ search name, subpath, or .ext...")
+                .placeholder("/ search name, subpath, or .ext... (Down jumps to list)")
                 .flex_1()
                 .px_3()
                 .py(px(6.0))
@@ -208,23 +684,23 @@ fn build_search_bar() -> View {
                 .bg(palette::BG_INSET)
                 .border_1()
                 .border_color(palette::BORDER_SUBTLE)
+                .focus(|s| s.border_color(palette::BORDER_ACTIVE))
                 .rounded_md()
                 .text_color(palette::TEXT_PRIMARY)
                 .placeholder_color(palette::TEXT_FAINT),
         )
-        .child(when(
-            move || state::browse_signal().with(|b| !b.search_text.is_empty()),
-            clear_search_btn,
-        ))
+        .child(when(move || is_searching.get(), clear_search_btn))
 }
 
-fn clear_search_btn() -> nsh_base::ButtonElement {
+fn clear_search_btn() -> ButtonElement {
     button()
         .accessibility_label("Clear search")
         .on_press(|| {
-            state::browse_signal().update(|b| {
-                b.search_text.clear();
-                b.selected_row = 0;
+            batch(|| {
+                state::browse_signal().update(|b| {
+                    b.search_text.clear();
+                });
+                state::selection_signal().update(SelectionState::clear);
             });
         })
         .px_2()
@@ -242,10 +718,15 @@ fn clear_search_btn() -> nsh_base::ButtonElement {
         )
 }
 
-fn build_filter_strip(tree: &StorageTree) -> View {
-    let browse = state::browse_signal().get();
-    let header_node_id = browse.current_node.unwrap_or_else(|| tree.root_id());
-    let unused_bytes = match (browse.current_node, browse.selected_category) {
+fn build_filter_strip(
+    tree: &StorageTree,
+    current_node: Option<NodeId>,
+    selected_category: Option<StorageCategory>,
+    filter_mode: FilterMode,
+    sort_order: SortOrder,
+) -> View {
+    let header_node_id = current_node.unwrap_or_else(|| tree.root_id());
+    let unused_bytes = match (current_node, selected_category) {
         (None, Some(cat)) => tree
             .category_entries(cat)
             .iter()
@@ -255,7 +736,7 @@ fn build_filter_strip(tree: &StorageTree) -> View {
         _ => tree.node(header_node_id).map_or(0, |n| n.unused_bytes),
     };
 
-    let junk_only = browse.filter_mode == FilterMode::JunkAndUnusedOnly;
+    let junk_only = filter_mode == FilterMode::JunkAndUnusedOnly;
     view()
         .flex_row()
         .flex_wrap()
@@ -277,7 +758,7 @@ fn build_filter_strip(tree: &StorageTree) -> View {
                 palette::TEXT_FAINT
             }),
         )
-        .child(filter_controls(junk_only, browse.sort_order))
+        .child(filter_controls(junk_only, sort_order))
 }
 
 fn filter_controls(junk_only: bool, sort_order: SortOrder) -> View {
@@ -289,12 +770,14 @@ fn filter_controls(junk_only: bool, sort_order: SortOrder) -> View {
             button()
                 .accessibility_label("Toggle junk and unused filter")
                 .on_press(|| {
-                    state::browse_signal().update(|b| {
-                        b.filter_mode = match b.filter_mode {
-                            FilterMode::All => FilterMode::JunkAndUnusedOnly,
-                            FilterMode::JunkAndUnusedOnly | _ => FilterMode::All,
-                        };
-                        b.selected_row = 0;
+                    batch(|| {
+                        state::browse_signal().update(|b| {
+                            b.filter_mode = match b.filter_mode {
+                                FilterMode::All => FilterMode::JunkAndUnusedOnly,
+                                FilterMode::JunkAndUnusedOnly | _ => FilterMode::All,
+                            };
+                        });
+                        state::selection_signal().update(SelectionState::clear);
                     });
                 })
                 .px_2()
@@ -331,13 +814,15 @@ fn filter_controls(junk_only: bool, sort_order: SortOrder) -> View {
             button()
                 .accessibility_label("Cycle sort order")
                 .on_press(|| {
-                    state::browse_signal().update(|b| {
-                        b.sort_order = match b.sort_order {
-                            SortOrder::SizeDesc => SortOrder::AgeOldestFirst,
-                            SortOrder::AgeOldestFirst => SortOrder::NameAsc,
-                            SortOrder::NameAsc | _ => SortOrder::SizeDesc,
-                        };
-                        b.selected_row = 0;
+                    batch(|| {
+                        state::browse_signal().update(|b| {
+                            b.sort_order = match b.sort_order {
+                                SortOrder::SizeDesc => SortOrder::AgeOldestFirst,
+                                SortOrder::AgeOldestFirst => SortOrder::NameAsc,
+                                SortOrder::NameAsc | _ => SortOrder::SizeDesc,
+                            };
+                        });
+                        state::selection_signal().update(SelectionState::clear);
                     });
                 })
                 .px_2()
@@ -414,9 +899,11 @@ fn build_breadcrumbs(
             button()
                 .accessibility_label(format!("Breadcrumb {label}"))
                 .on_press(move || {
-                    state::browse_signal().update(|b| {
-                        b.current_node = target;
-                        b.selected_row = 0;
+                    batch(|| {
+                        state::browse_signal().update(|b| {
+                            b.current_node = target;
+                        });
+                        state::selection_signal().update(SelectionState::clear);
                     });
                 })
                 .cursor(Cursor::Pointer)
@@ -434,33 +921,8 @@ fn build_breadcrumbs(
         }))
 }
 
-fn item_list_section(tree: &Arc<StorageTree>) -> View {
-    let count_tree = Arc::clone(tree);
-    let items_tree = Arc::clone(tree);
-    let rows_tree = Arc::clone(tree);
-    let empty_tree = Arc::clone(tree);
-
-    let list_header = view()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .pb_1()
-        .border_b_1()
-        .border_color(palette::BORDER_SUBTLE)
-        .child(
-            text(move || format!("{} items", state::visible_items(&count_tree).len()))
-                .font_family(palette::mono_font())
-                .tabular_nums()
-                .text_size(px(12.0))
-                .text_color(palette::TEXT_MUTED),
-        )
-        .child(
-            text("last used")
-                .font_family(palette::mono_font())
-                .text_size(px(12.0))
-                .text_color(palette::TEXT_FAINT),
-        );
-
+fn item_list_section(ctrl: &ExplorerController) -> View {
+    let display = ctrl.data.display_items;
     let empty_state = || {
         view().py_6().items_center().child(
             text("No matching entries in this scope")
@@ -470,21 +932,165 @@ fn item_list_section(tree: &Arc<StorageTree>) -> View {
         )
     };
 
-    view().flex_1().gap_2().child(list_header).child(
-        scroll().flex_1().child(
+    let row_ctrl = ctrl.clone();
+    let viewable_store = Rc::clone(&ctrl.viewable_range);
+    let active_ctrl = ctrl.clone();
+    let list_focus = ctrl.list_focused;
+
+    let list_container = view()
+        .flex_1()
+        .min_h(px(0.0))
+        .role(AccessibilityRole::Listbox)
+        .label("Storage items")
+        .focusable(true)
+        .accessibility_active_descendant(move || active_ctrl.active_row_ref())
+        .element_ref(&ctrl.listbox_ref)
+        .on_focus(move || list_focus.set(true))
+        .on_blur(move || list_focus.set(false))
+        .rounded_md()
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(palette::BORDER_ACTIVE))
+        .child(
+            virtual_list(
+                move || display.with(|d| d.len()),
+                move |at| explorer_row_cell(&row_ctrl, at),
+            )
+            .keys(move || display.with(|d| d.iter().map(|id| id.index()).collect::<Vec<_>>()))
+            .estimated_item_size(px(46.0))
+            .row_gap(px(4.0))
+            .viewability(nsh_core::prelude::Viewability {
+                item_visible_threshold: Some(Percentage(0.995)),
+                ..nsh_core::prelude::Viewability::default()
+            })
+            .on_viewable_items_change(move |v: &ViewableItems| {
+                viewable_store.set(v.viewable);
+            })
+            .empty(empty_state())
+            .element_ref(&ctrl.list_ref)
+            .flex_1(),
+        );
+
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .gap_2()
+        .child(build_list_header(ctrl))
+        .child(list_container)
+}
+
+fn list_header_selection_summary(
+    tree: Arc<StorageTree>,
+    visible: Memo<Arc<Vec<NodeId>>>,
+    multi_selected: Memo<bool>,
+) -> View {
+    let selected_info = computed(move || {
+        visible.with(|vis| {
+            state::selection_signal().with(|sel| {
+                let count = sel.selected.len();
+                let bytes: u64 = vis
+                    .iter()
+                    .filter(|id| sel.selected.contains(id))
+                    .filter_map(|id| tree.node(*id))
+                    .map(|n| n.total_bytes)
+                    .sum();
+                (count, bytes)
+            })
+        })
+    });
+
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(
+            text(move || format!("{} items", visible.with(|v| v.len())))
+                .font_family(palette::mono_font())
+                .tabular_nums()
+                .text_size(px(12.0))
+                .text_color(palette::TEXT_MUTED),
+        )
+        .child(when(
+            move || multi_selected.get(),
+            move || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        text("·")
+                            .font_family(palette::mono_font())
+                            .text_size(px(12.0))
+                            .text_color(palette::TEXT_FAINT),
+                    )
+                    .child(
+                        text(move || format!("{} selected", selected_info.get().0))
+                            .font_family(palette::mono_font())
+                            .tabular_nums()
+                            .text_size(px(12.0))
+                            .text_color(palette::WARN_AMBER),
+                    )
+                    .child(
+                        text(move || {
+                            format!(
+                                "({}) · press s to snag",
+                                format_bytes(selected_info.get().1)
+                            )
+                        })
+                        .font_family(palette::mono_font())
+                        .tabular_nums()
+                        .text_size(px(12.0))
+                        .text_color(palette::TEXT_MUTED),
+                    )
+            },
+        ))
+}
+
+fn build_list_header(ctrl: &ExplorerController) -> View {
+    let tree = Arc::clone(&ctrl.tree);
+    let visible = ctrl.data.visible_items;
+    let multi_selected = ctrl.multi_selected;
+    let snag_ctrl = ctrl.clone();
+
+    view()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .pb_1()
+        .border_b_1()
+        .border_color(palette::BORDER_SUBTLE)
+        .child(list_header_selection_summary(tree, visible, multi_selected))
+        .child(
             view()
-                .gap_1()
-                .child(each(
-                    move || state::explorer_display_items(&items_tree),
-                    |id| *id,
-                    move |id_sig, _idx_sig| explorer_row(&rows_tree, id_sig),
-                ))
+                .flex_row()
+                .items_center()
+                .gap_3()
                 .child(when(
-                    move || state::explorer_display_items(&empty_tree).is_empty(),
-                    empty_state,
-                )),
-        ),
-    )
+                    move || multi_selected.get(),
+                    move || {
+                        let bulk_ctrl = snag_ctrl.clone();
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(inline_action(
+                                "s snag selected",
+                                palette::WARN_AMBER,
+                                move || {
+                                    bulk_ctrl.snag_selected();
+                                },
+                            ))
+                            .child(inline_action("esc clear", palette::TEXT_MUTED, || {
+                                state::selection_signal()
+                                    .update(SelectionState::collapse_to_cursor);
+                            }))
+                    },
+                ))
+                .child(
+                    text("last used")
+                        .font_family(palette::mono_font())
+                        .text_size(px(12.0))
+                        .text_color(palette::TEXT_FAINT),
+                ),
+        )
 }
 
 fn snag_pop_out_motion() -> MotionSpec {
@@ -516,196 +1122,504 @@ fn snag_pop_out_motion() -> MotionSpec {
         )
 }
 
-fn explorer_row(tree: &Arc<StorageTree>, id_sig: ReadSignal<NodeId>) -> View {
-    let node_id = id_sig.get_untracked();
+fn bind_row_motion(
+    row_id: Memo<Option<NodeId>>,
+    is_exiting: Memo<bool>,
+) -> nsh_core::prelude::Motion {
     let row_motion = motion();
-    let was_exiting = Rc::new(Cell::new(false));
-    let effect_flag = Rc::clone(&was_exiting);
-
+    let exiting_id = Rc::new(Cell::new(None::<NodeId>));
     effect(move || {
-        let exiting = state::exiting_signal().with(|e| e.nodes.contains(&node_id));
-        if exiting && !effect_flag.get() {
-            effect_flag.set(true);
-            let _ = row_motion.play(snag_pop_out_motion());
-        } else if !exiting && effect_flag.get() {
-            effect_flag.set(false);
+        let cur = row_id.get();
+        let exiting = is_exiting.get();
+        if exiting {
+            if let Some(id) = cur
+                && exiting_id.get() != Some(id)
+            {
+                exiting_id.set(Some(id));
+                let _ = row_motion.play(snag_pop_out_motion());
+            }
+        } else if exiting_id.replace(None).is_some() {
             row_motion.reset();
         }
     });
+    row_motion
+}
 
-    let bg_tree = Arc::clone(tree);
-    let content_tree = Arc::clone(tree);
+fn bind_active_row(
+    ctrl: &ExplorerController,
+    row_id: Memo<Option<NodeId>>,
+    is_cursor: Memo<bool>,
+) -> ElementRef {
+    let row_ref = element_ref();
+    let active_signal = ctrl.active_row;
+    let claimed = Rc::new(Cell::new(None::<NodeId>));
+    effect(move || {
+        let cur = row_id.get();
+        let active = is_cursor.get();
+        untracked(|| match (cur, active) {
+            (Some(id), true) => {
+                claimed.set(Some(id));
+                active_signal.set(Some((id, row_ref)));
+            }
+            _ => {
+                if let Some(was) = claimed.replace(None)
+                    && active_signal.with(|a| a.is_some_and(|(aid, _)| aid == was))
+                {
+                    active_signal.set(None);
+                }
+            }
+        });
+    });
+    row_ref
+}
+
+fn make_row_press_handler(
+    ctrl: &ExplorerController,
+    row_id: Memo<Option<NodeId>>,
+) -> impl Fn(&PressEvent) + Clone + 'static {
+    let range_ctrl = ctrl.clone();
+    let listbox = ctrl.listbox_ref;
+    let tree = Arc::clone(&ctrl.tree);
+
+    move |ev: &PressEvent| {
+        let Some(id) = row_id.get_untracked() else {
+            return;
+        };
+        if state::exiting_signal().with_untracked(|e| e.nodes.contains(&id)) {
+            return;
+        }
+        listbox.focus();
+
+        if ev.modifiers.shift {
+            range_ctrl.select_range_to(id);
+            return;
+        }
+        if ev.modifiers.cmd || ev.modifiers.ctrl {
+            state::selection_signal().update(|sel| sel.toggle_item(id));
+            return;
+        }
+
+        let is_dir = tree
+            .node(id)
+            .is_some_and(|n| n.kind == EntryKind::Directory);
+        let was_single_cursor = state::selection_signal()
+            .with_untracked(|sel| sel.cursor == Some(id) && sel.selected.len() == 1);
+        if is_dir && (was_single_cursor || ev.clicks >= 2) {
+            state::open_node(id);
+        } else {
+            state::selection_signal().update(|sel| sel.select_single(id));
+        }
+    }
+}
+
+fn explorer_row_cell(ctrl: &ExplorerController, at: Position) -> View {
+    let display = ctrl.data.display_items;
+    let row_id = computed(move || display.with(|d| d.get(at.index()).copied()));
+    let is_exiting = computed(move || {
+        row_id
+            .get()
+            .is_some_and(|id| state::exiting_signal().with(|e| e.nodes.contains(&id)))
+    });
+    let is_cursor = computed(move || {
+        !is_exiting.get()
+            && row_id
+                .get()
+                .is_some_and(|id| state::selection_signal().with(|s| s.cursor == Some(id)))
+    });
+    let is_selected = computed(move || {
+        !is_exiting.get()
+            && row_id
+                .get()
+                .is_some_and(|id| state::selection_signal().with(|s| s.selected.contains(&id)))
+    });
+    let multi_selected = ctrl.multi_selected;
+    let row_motion = bind_row_motion(row_id, is_exiting);
+    let row_ref = bind_active_row(ctrl, row_id, is_cursor);
+    let on_press = make_row_press_handler(ctrl, row_id);
+
+    let label_tree = Arc::clone(&ctrl.tree);
+    let row_label = move || {
+        row_id
+            .get()
+            .and_then(|id| {
+                label_tree
+                    .node(id)
+                    .map(|n| format!("{}, {}", n.name, format_bytes(n.total_bytes)))
+            })
+            .unwrap_or_default()
+    };
+
+    let main_line = view()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(row_left_group(
+            ctrl,
+            row_id,
+            is_cursor,
+            is_selected,
+            is_exiting,
+            on_press.clone(),
+        ))
+        .child(row_right_group(ctrl, row_id, is_selected, on_press));
 
     view()
+        .role(AccessibilityRole::Option)
+        .focusable(false)
+        .label(row_label)
+        .accessibility_state(move || AccessibilityState {
+            selected: is_selected.get(),
+            ..AccessibilityState::default()
+        })
+        .element_ref(&row_ref)
+        .group()
         .bind_motion(&row_motion)
         .px_2()
         .py(px(6.0))
         .rounded_md()
+        .border_l_1()
+        .border_color(move || {
+            if is_selected.get() && multi_selected.get() {
+                palette::WARN_AMBER
+            } else if is_cursor.get() {
+                palette::BORDER_ACTIVE
+            } else {
+                rgba(0)
+            }
+        })
         .bg(move || {
-            let exiting = state::exiting_signal().with(|e| e.nodes.contains(&node_id));
-            if exiting {
+            if is_exiting.get() {
                 palette::WARN_SURFACE
-            } else if state::is_row_selected(&bg_tree, node_id) {
+            } else if is_selected.get() {
                 palette::BG_SELECTED
             } else {
                 palette::BG_CANVAS
             }
         })
-        .child(dynamic(move || {
-            explorer_row_contents(&content_tree, node_id)
-        }))
+        .hover(|s| s.bg(palette::BG_HOVER))
+        .child(main_line)
+        .child(row_subline(ctrl, row_id, is_cursor))
+}
+
+fn row_left_group(
+    ctrl: &ExplorerController,
+    row_id: Memo<Option<NodeId>>,
+    is_cursor: Memo<bool>,
+    is_selected: Memo<bool>,
+    is_exiting: Memo<bool>,
+    on_press: impl Fn(&PressEvent) + Clone + 'static,
+) -> View {
+    let name_tree = Arc::clone(&ctrl.tree);
+    let kind_tree = Arc::clone(&ctrl.tree);
+    let hint_tree = Arc::clone(&ctrl.tree);
+    let snag_tree = Arc::clone(&ctrl.tree);
+    let display = ctrl.data.display_items;
+    let spacer_press = on_press.clone();
+
+    let name_hit_area = view()
+        .flex_row()
+        .items_center()
+        .flex_shrink(1.0)
+        .min_w(px(0.0))
+        .gap_2()
+        .cursor(Cursor::Pointer)
+        .on_press(on_press)
+        .child(
+            text(move || {
+                if is_cursor.get() {
+                    ">"
+                } else if is_selected.get() {
+                    "✓"
+                } else {
+                    " "
+                }
+            })
+            .font_family(palette::mono_font())
+            .text_size(px(12.0))
+            .text_color(move || {
+                if !is_cursor.get() && is_selected.get() {
+                    palette::WARN_AMBER
+                } else {
+                    palette::TEXT_PRIMARY
+                }
+            }),
+        )
+        .child(
+            text(move || {
+                let is_dir = row_id
+                    .get()
+                    .and_then(|id| kind_tree.node(id))
+                    .is_some_and(|n| n.kind == EntryKind::Directory);
+                if is_dir { "▸" } else { "•" }
+            })
+            .font_family(palette::mono_font())
+            .text_size(px(11.0))
+            .text_color(move || {
+                if is_selected.get() {
+                    palette::TEXT_PRIMARY
+                } else {
+                    palette::TEXT_FAINT
+                }
+            }),
+        )
+        .child(
+            text(move || {
+                row_id
+                    .get()
+                    .and_then(|id| name_tree.node(id))
+                    .map(|node| {
+                        if node.kind == EntryKind::Directory {
+                            format!("{}/", node.name)
+                        } else {
+                            node.name.clone()
+                        }
+                    })
+                    .unwrap_or_default()
+            })
+            .font_family(palette::mono_font())
+            .font_weight(FontWeight::MEDIUM)
+            .text_size(px(13.0))
+            .text_color(move || {
+                if is_selected.get() {
+                    palette::TEXT_PRIMARY
+                } else {
+                    palette::TEXT_MUTED
+                }
+            })
+            .flex_shrink(1.0)
+            .min_w(px(0.0))
+            .truncate(),
+        );
+
+    let snag_pill = hover_snag_button(snag_tree, row_id, display, is_exiting);
+    let trailing_badges = row_trailing_badges(hint_tree, row_id, is_exiting);
+
+    view()
+        .flex_row()
+        .items_center()
+        .flex_1()
+        .min_w(px(0.0))
+        .gap_2()
+        .child(name_hit_area)
+        .child(snag_pill)
+        .child(trailing_badges)
+        .child(
+            view()
+                .flex_1()
+                .h_full()
+                .cursor(Cursor::Pointer)
+                .on_press(spacer_press),
+        )
+}
+
+fn row_trailing_badges(
+    hint_tree: Arc<StorageTree>,
+    row_id: Memo<Option<NodeId>>,
+    is_exiting: Memo<bool>,
+) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .flex_shrink_0()
+        .child(when(
+            move || {
+                row_id
+                    .get()
+                    .and_then(|id| hint_tree.node(id))
+                    .is_some_and(|n| n.junk_kind.is_some())
+            },
+            || {
+                text("unused")
+                    .font_family(palette::mono_font())
+                    .text_size(px(11.0))
+                    .text_color(palette::WARN_AMBER)
+            },
+        ))
+        .child(when(
+            move || is_exiting.get(),
+            || {
+                text("→ queued")
+                    .font_family(palette::mono_font())
+                    .text_size(px(11.0))
+                    .text_color(palette::WARN_AMBER)
+            },
+        ))
+}
+
+fn hover_snag_button(
+    tree: Arc<StorageTree>,
+    row_id: Memo<Option<NodeId>>,
+    display: Memo<Arc<Vec<NodeId>>>,
+    is_exiting: Memo<bool>,
+) -> View {
+    view()
+        .role(AccessibilityRole::Button)
+        .focusable(false)
+        .label(move || {
+            let name = row_id
+                .get()
+                .and_then(|id| tree.node(id).map(|n| n.name.as_str()))
+                .unwrap_or("item");
+            format!("Snag {name}")
+        })
+        .on_press(move || {
+            if is_exiting.get_untracked() {
+                return;
+            }
+            if let Some(id) = row_id.get_untracked() {
+                display.with_untracked(|d| state::snag_nodes_in_display(&[id], d));
+            }
+        })
+        .flex_shrink_0()
+        .px(px(6.0))
+        .py(px(1.5))
+        .rounded_sm()
+        .bg(palette::WARN_SURFACE)
+        .border_1()
+        .border_color(palette::WARN_AMBER.opacity(0.6))
+        .cursor(Cursor::Pointer)
+        .opacity(0.0)
+        .pointer_events(PointerEvents::None)
+        .group_hover(|s| s.opacity(1.0).pointer_events(PointerEvents::Auto))
+        .hover(|s| {
+            s.bg(palette::WARN_AMBER.opacity(0.25))
+                .border_color(palette::WARN_AMBER)
+        })
+        .child(
+            text("snag")
+                .font_family(palette::mono_font())
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(11.0))
+                .text_color(palette::WARN_AMBER),
+        )
+}
+
+fn row_right_group(
+    ctrl: &ExplorerController,
+    row_id: Memo<Option<NodeId>>,
+    is_selected: Memo<bool>,
+    on_press: impl Fn(&PressEvent) + 'static,
+) -> View {
+    let bytes_tree = Arc::clone(&ctrl.tree);
+    let pct_tree = Arc::clone(&ctrl.tree);
+    let age_label_tree = Arc::clone(&ctrl.tree);
+    let age_color_tree = Arc::clone(&ctrl.tree);
+    let dot_tree = Arc::clone(&ctrl.tree);
+    let scope_bytes = ctrl.scope_bytes;
+
+    view()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .gap_3()
+        .cursor(Cursor::Pointer)
+        .on_press(on_press)
+        .child(
+            text(move || {
+                let bytes = row_id
+                    .get()
+                    .and_then(|id| bytes_tree.node(id).map(|n| n.total_bytes))
+                    .unwrap_or(0);
+                format_bytes(bytes)
+            })
+            .font_family(palette::mono_font())
+            .tabular_nums()
+            .text_size(px(12.0))
+            .text_color(move || {
+                if is_selected.get() {
+                    palette::TEXT_PRIMARY
+                } else {
+                    palette::TEXT_MUTED
+                }
+            }),
+        )
+        .child(reactive_mini_dot_bar(dot_tree, row_id, scope_bytes, 10))
+        .child(
+            text(move || {
+                let bytes = row_id
+                    .get()
+                    .and_then(|id| pct_tree.node(id).map(|n| n.total_bytes))
+                    .unwrap_or(0);
+                let total = scope_bytes.get().max(1);
+                let pct = (bytes.saturating_mul(100) / total).min(100);
+                format!("{pct:>3}%")
+            })
+            .font_family(palette::mono_font())
+            .tabular_nums()
+            .text_size(px(12.0))
+            .text_color(palette::TEXT_FAINT),
+        )
+        .child(
+            text(move || {
+                row_id
+                    .get()
+                    .and_then(|id| age_label_tree.node(id))
+                    .map(|node| format_age(node.modified, age_label_tree.scanned_at()).label)
+                    .unwrap_or_default()
+            })
+            .font_family(palette::mono_font())
+            .tabular_nums()
+            .text_size(px(12.0))
+            .text_color(move || {
+                let freshness = row_id
+                    .get()
+                    .and_then(|id| age_color_tree.node(id))
+                    .map_or(AgeFreshness::Unknown, |node| {
+                        format_age(node.modified, age_color_tree.scanned_at()).freshness
+                    });
+                match freshness {
+                    AgeFreshness::Stale => palette::WARN_AMBER,
+                    AgeFreshness::Today | AgeFreshness::Recent | AgeFreshness::Unknown | _ => {
+                        palette::TEXT_MUTED
+                    }
+                }
+            })
+            .w(px(46.0)),
+        )
 }
 
 #[expect(
-    clippy::too_many_lines,
-    reason = "explorer row coordinates selection, path hint, culprit summary, and inline actions"
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "reactive dot meter maps clamped [0.0, 1.0] share fraction to integer dot count"
 )]
-fn explorer_row_contents(tree: &Arc<StorageTree>, node_id: NodeId) -> Option<View> {
-    let node = tree.node(node_id)?;
-    let is_exiting = state::exiting_signal().with(|e| e.nodes.contains(&node_id));
-    let is_selected = !is_exiting && state::is_row_selected(tree, node_id);
-    let scope_bytes = state::current_scope_bytes(tree).max(1);
-    let browse = state::browse_signal().get();
-    let is_searching = !browse.search_text.trim().is_empty();
+fn reactive_mini_dot_bar(
+    tree: Arc<StorageTree>,
+    row_id: Memo<Option<NodeId>>,
+    scope_bytes: Memo<u64>,
+    total_dots: usize,
+) -> View {
+    let meter = computed(move || {
+        let Some(node) = row_id.get().and_then(|id| tree.node(id)) else {
+            return (0_usize, palette::DOT_EMPTY);
+        };
+        let total = scope_bytes.get().max(1);
+        let share = (node.total_bytes as f32 / total as f32).clamp(0.0, 1.0);
+        let filled = if share <= 0.005 {
+            0
+        } else {
+            ((share * total_dots as f32).round() as usize).clamp(1, total_dots)
+        };
+        (filled, palette::category_color(node.category))
+    });
 
-    let row_accent = palette::category_color(node.category);
-    let share_pct = (node.total_bytes.saturating_mul(100) / scope_bytes).min(100);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "visual dot bar fraction tolerates f32 precision"
-    )]
-    let share_ratio = (node.total_bytes as f32 / scope_bytes as f32).clamp(0.0, 1.0);
-    let age = format_age(node.modified, tree.scanned_at());
-    let age_color = match age.freshness {
-        AgeFreshness::Stale => palette::WARN_AMBER,
-        AgeFreshness::Today | AgeFreshness::Recent | AgeFreshness::Unknown | _ => {
-            palette::TEXT_MUTED
-        }
-    };
-
-    let is_dir = node.kind == EntryKind::Directory;
-    let name_display = if is_dir {
-        format!("{}/", node.name)
-    } else {
-        node.name.clone()
-    };
-    let is_unused = node.junk_kind.is_some();
-    let parent_hint = if is_searching {
-        search_parent_hint(tree, node, browse.current_node)
-    } else {
-        None
-    };
-
-    let press_tree = Arc::clone(tree);
-    let main_row = button()
-        .accessibility_label(format!("Item {}", node.name))
-        .on_press(move || {
-            if state::exiting_signal().with_untracked(|e| e.nodes.contains(&node_id)) {
-                return;
-            }
-            let already = state::is_row_selected_untracked(&press_tree, node_id);
-            if already && is_dir {
-                state::open_node(node_id);
-            } else {
-                state::select_visible_node(&press_tree, node_id);
-            }
-        })
+    view()
         .flex_row()
         .items_center()
-        .justify_between()
-        .gap_3()
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .flex_1()
-                .gap_2()
-                .child(
-                    text(if is_selected { ">" } else { " " })
-                        .font_family(palette::mono_font())
-                        .text_size(px(12.0))
-                        .text_color(palette::TEXT_PRIMARY),
-                )
-                .child(
-                    text(if is_dir { "▸" } else { "•" })
-                        .font_family(palette::mono_font())
-                        .text_size(px(11.0))
-                        .text_color(if is_selected {
-                            palette::TEXT_PRIMARY
-                        } else {
-                            palette::TEXT_FAINT
-                        }),
-                )
-                .child(
-                    text(name_display)
-                        .font_family(palette::mono_font())
-                        .font_weight(if is_selected {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .text_size(px(13.0))
-                        .text_color(if is_selected {
-                            palette::TEXT_PRIMARY
-                        } else {
-                            palette::TEXT_MUTED
-                        })
-                        .truncate(),
-                )
-                .child(if is_unused {
-                    text("unused")
-                        .font_family(palette::mono_font())
-                        .text_size(px(11.0))
-                        .text_color(palette::WARN_AMBER)
+        .gap(px(2.5))
+        .children((0..total_dots).map(move |idx| {
+            view().w(px(3.0)).h(px(3.0)).rounded_full().bg(move || {
+                let (filled, accent) = meter.get();
+                if idx < filled {
+                    accent
                 } else {
-                    text("")
-                })
-                .child(if is_exiting {
-                    text("→ queued")
-                        .font_family(palette::mono_font())
-                        .text_size(px(11.0))
-                        .text_color(palette::WARN_AMBER)
-                } else {
-                    text("")
-                }),
-        )
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .child(
-                    text(format_bytes(node.total_bytes))
-                        .font_family(palette::mono_font())
-                        .tabular_nums()
-                        .text_size(px(12.0))
-                        .text_color(if is_selected {
-                            palette::TEXT_PRIMARY
-                        } else {
-                            palette::TEXT_MUTED
-                        }),
-                )
-                .child(palette::mini_dot_bar(share_ratio, row_accent, 10))
-                .child(
-                    text(format!("{share_pct:>3}%"))
-                        .font_family(palette::mono_font())
-                        .tabular_nums()
-                        .text_size(px(12.0))
-                        .text_color(palette::TEXT_FAINT),
-                )
-                .child(
-                    text(age.label.clone())
-                        .font_family(palette::mono_font())
-                        .tabular_nums()
-                        .text_size(px(12.0))
-                        .text_color(age_color)
-                        .w(px(46.0)),
-                ),
-        );
-
-    let sub_line = build_row_subline(node, is_selected, &age.label, parent_hint);
-
-    Some(view().child(main_row).child(sub_line))
+                    palette::DOT_EMPTY
+                }
+            })
+        }))
 }
 
 fn search_parent_hint(
@@ -734,86 +1648,112 @@ fn search_parent_hint(
     Some(format!("in {}/", shown.display()))
 }
 
-fn build_row_subline(
-    node: &DiskNode,
-    is_selected: bool,
-    age_label: &str,
-    parent_hint: Option<String>,
-) -> Option<View> {
-    let node_id = node.id;
-    let is_dir = node.kind == EntryKind::Directory;
-    let hint_line = parent_hint.map(|hint| {
-        text(hint)
-            .font_family(palette::mono_font())
-            .text_size(px(11.0))
-            .text_color(palette::TEXT_FAINT)
-            .truncate()
+fn row_subline(
+    ctrl: &ExplorerController,
+    row_id: Memo<Option<NodeId>>,
+    is_cursor: Memo<bool>,
+) -> View {
+    let is_searching = ctrl.is_searching;
+    let scope_node = ctrl.scope_node;
+    let multi_selected = ctrl.multi_selected;
+    let show_actions = computed(move || is_cursor.get() && !multi_selected.get());
+
+    let hint_tree = Arc::clone(&ctrl.tree);
+    let hint_text = computed(move || {
+        if !is_searching.get() {
+            return None;
+        }
+        let id = row_id.get()?;
+        let node = hint_tree.node(id)?;
+        search_parent_hint(&hint_tree, node, scope_node.get())
     });
 
-    if is_selected {
-        let meta_line = is_dir.then(|| {
-            let item_total = node.file_count + node.dir_count;
-            text(format!("{item_total} items · changed {age_label}"))
-                .font_family(palette::mono_font())
-                .text_size(px(11.0))
-                .text_color(palette::TEXT_MUTED)
-        });
+    let culprit_tree = Arc::clone(&ctrl.tree);
+    let culprit_text = computed(move || {
+        let id = row_id.get()?;
+        let node = culprit_tree.node(id)?;
+        node.largest_culprit.as_ref().map(|culprit| {
+            format!(
+                "└ mostly in {}  {} · {}%",
+                culprit.relative_subpath,
+                format_bytes(culprit.bytes),
+                culprit.share_percent
+            )
+        })
+    });
 
-        let culprit_sub = if is_dir {
-            node.largest_culprit.as_ref().map(|culprit| {
-                text(format!(
-                    "└ mostly in {}  {} · {}%",
-                    culprit.relative_subpath,
-                    format_bytes(culprit.bytes),
-                    culprit.share_percent
-                ))
-                .font_family(palette::mono_font())
-                .tabular_nums()
-                .text_size(px(11.0))
-                .text_color(palette::TEXT_MUTED)
-                .truncate()
-            })
-        } else {
-            None
-        };
+    let meta_tree = Arc::clone(&ctrl.tree);
+    let meta_text = computed(move || {
+        let id = row_id.get()?;
+        let node = meta_tree.node(id)?;
+        if node.kind != EntryKind::Directory {
+            return None;
+        }
+        let item_total = node.file_count + node.dir_count;
+        let age = format_age(node.modified, meta_tree.scanned_at());
+        Some(format!("{item_total} items · changed {}", age.label))
+    });
 
-        let has_culprit = is_dir && node.largest_culprit.is_some();
-        let actions_bar = selected_actions_bar(node_id, has_culprit);
+    let actions_tree = Arc::clone(&ctrl.tree);
+    let display = ctrl.data.display_items;
 
-        return Some(
-            view()
-                .pl_6()
-                .gap_1()
-                .pt_1()
-                .child(hint_line)
-                .child(meta_line)
-                .child(culprit_sub)
-                .child(actions_bar),
-        );
-    }
-
-    let culprit_line = node.largest_culprit.as_ref().map(|culprit| {
-        text(format!(
-            "└ mostly in {}  {} · {}%",
-            culprit.relative_subpath,
-            format_bytes(culprit.bytes),
-            culprit.share_percent
+    view()
+        .pl_6()
+        .gap_1()
+        .child(when(
+            move || hint_text.with(Option::is_some),
+            move || {
+                text(move || hint_text.get().unwrap_or_default())
+                    .font_family(palette::mono_font())
+                    .text_size(px(11.0))
+                    .text_color(palette::TEXT_FAINT)
+                    .truncate()
+            },
         ))
-        .font_family(palette::mono_font())
-        .tabular_nums()
-        .text_size(px(11.0))
-        .text_color(palette::TEXT_FAINT)
-        .truncate()
-    });
-
-    if hint_line.is_none() && culprit_line.is_none() {
-        return None;
-    }
-
-    Some(view().pl_6().child(hint_line).child(culprit_line))
+        .child(when(
+            move || show_actions.get() && meta_text.with(Option::is_some),
+            move || {
+                text(move || meta_text.get().unwrap_or_default())
+                    .font_family(palette::mono_font())
+                    .text_size(px(11.0))
+                    .text_color(palette::TEXT_MUTED)
+            },
+        ))
+        .child(when(
+            move || culprit_text.with(Option::is_some),
+            move || {
+                text(move || culprit_text.get().unwrap_or_default())
+                    .font_family(palette::mono_font())
+                    .tabular_nums()
+                    .text_size(px(11.0))
+                    .text_color(move || {
+                        if show_actions.get() {
+                            palette::TEXT_MUTED
+                        } else {
+                            palette::TEXT_FAINT
+                        }
+                    })
+                    .truncate()
+            },
+        ))
+        .child(when(
+            move || show_actions.get(),
+            move || selected_actions_bar(Arc::clone(&actions_tree), row_id, display),
+        ))
 }
 
-fn selected_actions_bar(node_id: NodeId, has_culprit: bool) -> View {
+fn selected_actions_bar(
+    tree: Arc<StorageTree>,
+    row_id: Memo<Option<NodeId>>,
+    display: Memo<Arc<Vec<NodeId>>>,
+) -> View {
+    let has_culprit = computed(move || {
+        row_id
+            .get()
+            .and_then(|id| tree.node(id))
+            .is_some_and(|n| n.kind == EntryKind::Directory && n.largest_culprit.is_some())
+    });
+
     view()
         .flex_row()
         .items_center()
@@ -824,26 +1764,43 @@ fn selected_actions_bar(node_id: NodeId, has_culprit: bool) -> View {
             "→ open",
             palette::TEXT_PRIMARY,
             move || {
-                state::open_node(node_id);
+                if let Some(id) = row_id.get_untracked() {
+                    state::open_node(id);
+                }
             },
         ))
-        .child(has_culprit.then(|| {
-            inline_action("g go to culprit", palette::TEXT_MUTED, move || {
-                state::jump_to_culprit(node_id);
-            })
-        }))
+        .child(when(
+            move || has_culprit.get(),
+            move || {
+                inline_action("g go to culprit", palette::TEXT_MUTED, move || {
+                    if let Some(id) = row_id.get_untracked() {
+                        state::jump_to_culprit(id);
+                    }
+                })
+            },
+        ))
         .child(inline_action(
             "o reveal in finder",
             palette::TEXT_MUTED,
-            move || state::reveal_node(node_id),
+            move || {
+                if let Some(id) = row_id.get_untracked() {
+                    state::reveal_node(id);
+                }
+            },
         ))
         .child(inline_action("s snag", palette::WARN_AMBER, move || {
-            state::snag_node(node_id);
+            if let Some(id) = row_id.get_untracked() {
+                display.with_untracked(|d| state::snag_nodes_in_display(&[id], d));
+            }
         }))
         .child(inline_action(
             "⌫ move to trash",
             palette::DANGER_RED,
-            move || state::quick_trash_node(node_id),
+            move || {
+                if let Some(id) = row_id.get_untracked() {
+                    state::quick_trash_node(id);
+                }
+            },
         ))
 }
 
@@ -851,7 +1808,7 @@ fn inline_action(
     label: &'static str,
     color: nsh_core::prelude::Rgba,
     on_press: impl Fn() + 'static,
-) -> nsh_base::ButtonElement {
+) -> ButtonElement {
     button()
         .accessibility_label(label)
         .on_press(on_press)
@@ -872,6 +1829,7 @@ fn inline_action(
 fn aggregates_section(tree: Arc<StorageTree>) -> View {
     view()
         .flex_1()
+        .min_h(px(0.0))
         .child(dynamic(move || build_aggregates_section(&tree)))
 }
 
@@ -909,6 +1867,7 @@ fn build_aggregates_section(tree: &StorageTree) -> View {
 
     view()
         .flex_1()
+        .min_h(px(0.0))
         .gap_3()
         .child(sub_tabs)
         .child(scroll().flex_1().child(list_content))
@@ -983,7 +1942,7 @@ fn extension_aggregate_list(by_extension: Vec<disk_space_core::ExtensionAggregat
         }))
 }
 
-fn agg_tab(label: &'static str, active: bool, kind: AggregateKind) -> nsh_base::ButtonElement {
+fn agg_tab(label: &'static str, active: bool, kind: AggregateKind) -> ButtonElement {
     button()
         .accessibility_label(label)
         .on_press(move || {

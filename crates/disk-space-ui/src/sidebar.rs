@@ -22,8 +22,10 @@ use crate::state;
     clippy::too_many_lines,
     reason = "renders the 9-row category meter and safety-jail card in one cohesive panel"
 )]
-pub(crate) fn categories_sidebar(tree: &StorageTree) -> View {
-    let browse = state::browse_signal().get();
+pub(crate) fn categories_sidebar(
+    tree: &StorageTree,
+    selected_category: Option<StorageCategory>,
+) -> View {
     let root_node = tree.node(tree.root_id());
     let total_used = root_node.map_or(0, |node| node.total_bytes).max(1);
     let max_category_bytes = StorageCategory::ALL
@@ -33,7 +35,7 @@ pub(crate) fn categories_sidebar(tree: &StorageTree) -> View {
         .unwrap_or(1)
         .max(1);
 
-    let all_selected = browse.selected_category.is_none();
+    let all_selected = selected_category.is_none();
 
     let all_row = button()
         .accessibility_label("All categories")
@@ -92,7 +94,7 @@ pub(crate) fn categories_sidebar(tree: &StorageTree) -> View {
 
     let category_rows = StorageCategory::ALL.into_iter().map(move |category| {
         let bytes = root_node.map_or(0, |node| node.category_totals.get(category));
-        let is_selected = browse.selected_category == Some(category);
+        let is_selected = selected_category == Some(category);
         let accent = palette::category_color(category);
         #[expect(
             clippy::cast_precision_loss,
