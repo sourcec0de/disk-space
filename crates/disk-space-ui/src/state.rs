@@ -1219,6 +1219,18 @@ pub(crate) fn quick_trash_node(node_id: NodeId) {
     }
 }
 
+/// Opens the destruction confirmation modal when staged items exist and no run is active.
+pub(crate) fn open_destruction_review() {
+    snag_signal().update(|s| {
+        if s.queue.items().is_empty() || s.running || s.confirm_open {
+            return;
+        }
+        s.drawer_open = true;
+        s.erase_input.clear();
+        s.confirm_open = true;
+    });
+}
+
 enum DestroyWorkerMsg {
     Progress(DestructionProgress),
     Done(DestructionReport, Option<disk_space_platform::VolumeInfo>),

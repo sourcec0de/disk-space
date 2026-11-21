@@ -51,6 +51,11 @@ fn search_down_arrow_enters_list_shift_selects_both_directions_and_hover_snags()
     app.wait_for("beta_other.txt")
         .expect("initial listing shows beta_other.txt");
 
+    // mod+enter with an empty queue does nothing.
+    app.press_key("mod+enter")
+        .expect("press mod+enter with empty queue");
+    assert!(!app.screen().shows("Confirm Storage Destruction"));
+
     // Type search query, then press Down to leave the input and focus the list.
     app.type_text("label:Search storage", "alpha")
         .expect("type search query");
@@ -128,4 +133,18 @@ fn search_down_arrow_enters_list_shift_selects_both_directions_and_hover_snags()
     app.wait_for_gone("role:button[Snag alpha_three.log]", Duration::from_secs(3))
         .expect("hover-snagged row animates out");
     assert!(app.screen().shows("beta_other.txt"));
+
+    app.press_key("mod+enter")
+        .expect("mod+enter opens Review & Execute confirmation modal");
+    app.wait_for("Confirm Storage Destruction")
+        .expect("confirm modal visible via mod+enter");
+
+    app.press_key("mod+enter")
+        .expect("second mod+enter while modal open is a no-op");
+    assert!(app.screen().shows("Confirm Storage Destruction"));
+
+    app.press_key("escape")
+        .expect("escape closes confirm modal");
+    app.wait_for_gone("Confirm Storage Destruction", Duration::from_secs(3))
+        .expect("confirm modal closes cleanly on escape");
 }

@@ -477,6 +477,17 @@ fn register_shortcuts() {
             state::start_scan(root);
         }
     });
+    on_key_with(
+        "mod+enter",
+        KeyOptions {
+            when: When::Always,
+            repeat: false,
+            ..KeyOptions::default()
+        },
+        |_| {
+            state::open_destruction_review();
+        },
+    );
 
     on_key_with(
         "escape",

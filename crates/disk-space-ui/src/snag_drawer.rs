@@ -12,6 +12,7 @@ use nsh_core::prelude::FontWeight;
 use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::Styled;
 use nsh_core::prelude::View;
+use nsh_core::prelude::key_label;
 use nsh_core::prelude::px;
 use nsh_core::prelude::scroll;
 use nsh_core::prelude::text;
@@ -216,12 +217,7 @@ pub(crate) fn snag_drawer(tree: &StorageTree) -> View {
     let action_btn = button()
         .accessibility_label("Review and destroy snagged items")
         .disabled(items.is_empty() || snag.running)
-        .on_press(|| {
-            state::snag_signal().update(|s| {
-                s.erase_input.clear();
-                s.confirm_open = true;
-            });
-        })
+        .on_press(state::open_destruction_review)
         .py_2()
         .px_3()
         .rounded_md()
@@ -233,12 +229,24 @@ pub(crate) fn snag_drawer(tree: &StorageTree) -> View {
         .border_color(palette::DANGER_RED)
         .disabled_style(|s| s.opacity(0.4))
         .child(
-            text(format!("Review & Execute ({})", format_bytes(total_bytes)))
-                .font_family(palette::mono_font())
-                .font_weight(FontWeight::SEMIBOLD)
-                .tabular_nums()
-                .text_size(px(12.0))
-                .text_color(palette::DANGER_RED),
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    text(format!("Review & Execute ({})", format_bytes(total_bytes)))
+                        .font_family(palette::mono_font())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .tabular_nums()
+                        .text_size(px(12.0))
+                        .text_color(palette::DANGER_RED),
+                )
+                .child(
+                    text(key_label("mod+enter"))
+                        .font_family(palette::mono_font())
+                        .text_size(px(10.0))
+                        .text_color(palette::TEXT_MUTED),
+                ),
         );
 
     view()
