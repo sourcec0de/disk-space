@@ -1,0 +1,40 @@
+# Rust / Cargo build outputs (keep Cargo.lock tracked for binary & Nix reproducibility)
+/target/
+**/*.rs.bk
+*.pdb
+
+# Nix build outputs & direnv (keep flake.lock tracked; no trailing slash on result symlinks)
+/result
+/result-*
+/.direnv/
+
+# Native Shell (nsh) local state / caches
+.nsh
+
+# Profiling & coverage artifacts
+*.profraw
+*.profdata
+lcov.info
+
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local environment & logs
+.env
+.env.local
+.env.*.local
+*.log
