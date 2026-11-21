@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/disk-space-platform",
+  "crates/disk-space-core",
+  "crates/disk-space-ui",
+  "crates/disk-space-app",
+]
+default-members = ["crates/disk-space-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+non_ascii_idents = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+# Conflicts directly with `rustc`'s `unreachable_pub = "deny"` on private modules.
+redundant_pub_crate = "allow"
+
+# Google Rust Style Guide & safety-critical restrictions
+wildcard_imports = "deny"
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+exit = "deny"
+exhaustive_enums = "deny"
+exhaustive_structs = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+mod_module_files = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+missing_safety_doc = "deny"
+str_to_string = "deny"
+clone_on_ref_ptr = "deny"
+pub_without_shorthand = "deny"
+semicolon_outside_block = "deny"
+shadow_unrelated = "deny"
+lossy_float_literal = "deny"
+filetype_is_file = "deny"
+
+[workspace.dependencies]
+disk-space-platform = { path = "crates/disk-space-platform" }
+disk-space-core = { path = "crates/disk-space-core" }
+disk-space-ui = { path = "crates/disk-space-ui" }
+
+nsh-core = { version = "0.6.1", default-features = false }
+nsh-base = { version = "0.6.1", default-features = false }
+nsh-engine = { version = "0.6.1", default-features = false }
+nsh-platform-macos = { version = "0.6.1", default-features = false }
+nsh-platform-linux = { version = "0.6.1", default-features = false }
+nsh-platform-windows = { version = "0.6.1", default-features = false }
+nsh-testing = { version = "0.6.1", default-features = false }
+
+crossbeam-channel = "0.5"
+env_logger = "0.11"
+getrandom = "0.3"
+libc = "0.2"
+log = "0.4"
+tempfile = "3"
+thiserror = "2"
+trash = "5"

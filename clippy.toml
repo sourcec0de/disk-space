@@ -1,0 +1,6 @@
+msrv = "1.97"
+allow-expect-in-tests = true
+allow-unwrap-in-tests = false
+allow-panic-in-tests = true
+too-many-lines-threshold = 100
+cognitive-complexity-threshold = 20

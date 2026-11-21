@@ -1,0 +1,19 @@
+[package]
+name = "disk-space-platform"
+description = "Cross-platform OS abstraction harness for disk-space."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+trash.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
