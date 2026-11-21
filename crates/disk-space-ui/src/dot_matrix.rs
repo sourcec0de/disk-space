@@ -2,6 +2,7 @@
 
 use std::f32::consts::TAU;
 
+use disk_space_core::NodeRef;
 use disk_space_core::StorageTree;
 use disk_space_core::format_bytes;
 use disk_space_platform::StorageCategory;
@@ -49,9 +50,7 @@ fn build_columns(tree: &StorageTree, total_cols: usize, staged_bytes: u64) -> Ve
     }
 
     let root_node = tree.node(tree.root_id());
-    let root_cat_totals = root_node
-        .map(|node| node.category_totals)
-        .unwrap_or_default();
+    let root_cat_totals = root_node.map(NodeRef::category_totals).unwrap_or_default();
     let scanned_total = root_cat_totals.total();
 
     let vol = tree.volume();
@@ -319,7 +318,7 @@ pub(crate) fn dot_matrix_bar() -> impl IntoElement {
             |cat| {
                 let bytes = tree
                     .node(tree.root_id())
-                    .map_or(0, |node| node.category_totals.get(cat));
+                    .map_or(0, |node| node.category_bytes(cat));
                 format!(
                     "{} · {} (click dot segment to toggle filter)",
                     cat.label(),

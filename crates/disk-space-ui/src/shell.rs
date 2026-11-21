@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use disk_space_core::FilterMode;
+use disk_space_core::NodeRef;
 use disk_space_core::StorageTree;
 use disk_space_core::format_bytes;
 use nsh_base::button;
@@ -359,7 +360,7 @@ fn capacity_headline() -> impl IntoElement {
             return "Scanning disk usage...".to_owned();
         };
         let vol = tree.volume();
-        let root_scanned = tree.node(tree.root_id()).map_or(0, |n| n.total_bytes);
+        let root_scanned = tree.node(tree.root_id()).map_or(0, NodeRef::total_bytes);
         let staged = state::snag_signal().with(|s| s.queue.total_bytes());
 
         let base = if vol.total_bytes > 0 {

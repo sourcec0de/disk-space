@@ -1,5 +1,6 @@
 //! Left sidebar displaying the 9 storage categories and the active root safety jail status.
 
+use disk_space_core::NodeRef;
 use disk_space_core::StorageTree;
 use disk_space_core::format_bytes;
 use disk_space_platform::StorageCategory;
@@ -27,10 +28,10 @@ pub(crate) fn categories_sidebar(
     selected_category: Option<StorageCategory>,
 ) -> View {
     let root_node = tree.node(tree.root_id());
-    let total_used = root_node.map_or(0, |node| node.total_bytes).max(1);
+    let total_used = root_node.map_or(0, NodeRef::total_bytes).max(1);
     let max_category_bytes = StorageCategory::ALL
         .iter()
-        .map(|&cat| root_node.map_or(0, |node| node.category_totals.get(cat)))
+        .map(|&cat| root_node.map_or(0, |node| node.category_bytes(cat)))
         .max()
         .unwrap_or(1)
         .max(1);
@@ -81,7 +82,7 @@ pub(crate) fn categories_sidebar(
                 ),
         )
         .child(
-            text(format_bytes(root_node.map_or(0, |n| n.total_bytes)))
+            text(format_bytes(root_node.map_or(0, NodeRef::total_bytes)))
                 .font_family(palette::mono_font())
                 .tabular_nums()
                 .text_size(px(12.0))
@@ -93,7 +94,7 @@ pub(crate) fn categories_sidebar(
         );
 
     let category_rows = StorageCategory::ALL.into_iter().map(move |category| {
-        let bytes = root_node.map_or(0, |node| node.category_totals.get(category));
+        let bytes = root_node.map_or(0, |node| node.category_bytes(category));
         let is_selected = selected_category == Some(category);
         let accent = palette::category_color(category);
         #[expect(
@@ -176,8 +177,8 @@ pub(crate) fn categories_sidebar(
     });
 
     let root_display = state::display_abs_path(tree.root().canonical_path());
-    let file_count = root_node.map_or(0, |n| n.file_count);
-    let dir_count = root_node.map_or(0, |n| n.dir_count);
+    let file_count = root_node.map_or(0, NodeRef::file_count);
+    let dir_count = root_node.map_or(0, NodeRef::dir_count);
 
     let jail_card = view()
         .mt_4()

@@ -18,6 +18,7 @@ use disk_space_core::DestructionReport;
 use disk_space_core::FilterMode;
 use disk_space_core::MAX_SEARCH_RESULTS;
 use disk_space_core::NodeId;
+use disk_space_core::NodeRef;
 use disk_space_core::ScanCancelHandle;
 use disk_space_core::ScanOptions;
 use disk_space_core::ScanProgress;
@@ -31,7 +32,7 @@ use disk_space_core::execute_destruction;
 use disk_space_core::format_bytes;
 use disk_space_core::scan_root;
 use disk_space_core::search_tree;
-use disk_space_core::search_tree_all;
+use disk_space_core::search_tree_bounded;
 use disk_space_core::truncate_and_sort_nodes;
 use disk_space_platform::PlatformHost;
 use disk_space_platform::StorageCategory;
@@ -606,6 +607,8 @@ pub(crate) struct ExplorerListData {
     pub(crate) display_items: Memo<Arc<Vec<NodeId>>>,
 }
 
+const MAX_NARROW_CACHE_ENTRIES: usize = 100_000;
+
 fn compute_raw_list_items(
     tree: &StorageTree,
     key: &ListQueryKey,
@@ -621,7 +624,12 @@ fn compute_raw_list_items(
         query.sort = key.sort_order;
         query.scope_node = key.current_node;
 
-        let all_matches = {
+        if !is_plain_name_query(&needle) {
+            *narrow_cache.borrow_mut() = None;
+            return Arc::new(search_tree(tree, &query));
+        }
+
+        let cached_outcome = {
             let cached = narrow_cache.borrow();
             cached
                 .as_ref()
@@ -633,28 +641,44 @@ fn compute_raw_list_items(
                         &needle,
                     )
                 })
-                .map_or_else(
-                    || search_tree_all(tree, &query, None),
-                    |cache| {
-                        if cache.needle == needle {
-                            cache.all_matches.clone()
-                        } else {
-                            search_tree_all(tree, &query, Some(&cache.all_matches))
-                        }
-                    },
-                )
+                .map(|cache| {
+                    if cache.needle == needle {
+                        let mut top = cache.all_matches.clone();
+                        truncate_and_sort_nodes(tree, &mut top, key.sort_order, MAX_SEARCH_RESULTS);
+                        (Some(top), None)
+                    } else {
+                        let (top, next_cache) = search_tree_bounded(
+                            tree,
+                            &query,
+                            Some(&cache.all_matches),
+                            MAX_SEARCH_RESULTS,
+                            MAX_NARROW_CACHE_ENTRIES,
+                        );
+                        (None, Some((top, next_cache)))
+                    }
+                })
         };
 
-        *narrow_cache.borrow_mut() = Some(NarrowCache {
+        let (top, next_cache) = match cached_outcome {
+            Some((Some(exact_top), None)) => return Arc::new(exact_top),
+            Some((None, Some(pair))) => pair,
+            _ => search_tree_bounded(
+                tree,
+                &query,
+                None,
+                MAX_SEARCH_RESULTS,
+                MAX_NARROW_CACHE_ENTRIES,
+            ),
+        };
+
+        *narrow_cache.borrow_mut() = next_cache.map(|all_matches| NarrowCache {
             scope_node: key.current_node,
             category: key.selected_category,
             filter_mode: key.filter_mode,
             needle,
-            all_matches: all_matches.clone(),
+            all_matches,
         });
 
-        let mut top = all_matches;
-        truncate_and_sort_nodes(tree, &mut top, key.sort_order, MAX_SEARCH_RESULTS);
         return Arc::new(top);
     }
 
@@ -769,8 +793,7 @@ fn filter_uncovered(
             if exiting.is_some_and(|set| set.contains(&id)) {
                 return true;
             }
-            tree.node(id)
-                .is_some_and(|node| !queue.is_covered(&node.relative_path))
+            tree.node(id).is_some() && !queue.is_node_covered(tree, id)
         })
         .collect()
 }
@@ -797,8 +820,8 @@ pub(crate) fn current_scope_bytes(tree: &StorageTree) -> u64 {
         match (browse.current_node, browse.selected_category) {
             (None, Some(cat)) => tree
                 .node(tree.root_id())
-                .map_or(0, |n| n.category_totals.get(cat)),
-            _ => tree.node(header_node_id).map_or(0, |n| n.total_bytes),
+                .map_or(0, |n| n.category_bytes(cat)),
+            _ => tree.node(header_node_id).map_or(0, NodeRef::total_bytes),
         }
     })
 }
@@ -834,7 +857,7 @@ pub(crate) fn open_node(node_id: NodeId) {
     let Some(node) = tree.node(node_id) else {
         return;
     };
-    if node.kind == disk_space_platform::EntryKind::Directory {
+    if node.kind() == disk_space_platform::EntryKind::Directory {
         batch(|| {
             browse_signal().update(|browse| {
                 browse.current_node = Some(node_id);
@@ -859,7 +882,7 @@ pub(crate) fn ascend_directory() {
     batch(|| {
         browse_signal().update(|browse| {
             if let Some(current) = browse.current_node {
-                let parent = tree.node(current).and_then(|node| node.parent);
+                let parent = tree.parent_of(current);
                 if current == tree.root_id()
                     || (parent == Some(tree.root_id()) && browse.selected_category.is_some())
                 {
@@ -881,7 +904,7 @@ pub(crate) fn jump_to_culprit(node_id: NodeId) {
     let Some(node) = tree.node(node_id) else {
         return;
     };
-    let Some(culprit) = &node.largest_culprit else {
+    let Some(culprit) = node.largest_culprit() else {
         return;
     };
     let target_id = culprit.target_id;
@@ -889,14 +912,14 @@ pub(crate) fn jump_to_culprit(node_id: NodeId) {
         return;
     };
 
-    if target.kind == disk_space_platform::EntryKind::Directory {
+    if target.kind() == disk_space_platform::EntryKind::Directory {
         batch(|| {
             browse_signal().update(|browse| {
                 browse.current_node = Some(target_id);
             });
             selection_signal().update(SelectionState::clear);
         });
-    } else if let Some(parent) = target.parent {
+    } else if let Some(parent) = target.parent() {
         batch(|| {
             browse_signal().update(|browse| {
                 browse.current_node = Some(parent);
@@ -928,7 +951,7 @@ pub(crate) fn snag_nodes_in_display(node_ids: &[NodeId], display: &[NodeId]) {
 }
 
 struct SnagBatchResult {
-    added: Vec<(NodeId, PathBuf, String, u64)>,
+    added: Vec<(NodeId, String, u64)>,
     consolidated_total: usize,
     already_covered: Option<PathBuf>,
     first_error: Option<String>,
@@ -951,8 +974,7 @@ fn collect_snag_batch(
         let Some(node) = tree.node(node_id) else {
             continue;
         };
-        let rel = node.relative_path.clone();
-        let already_staged_or_exiting = queue_copy.is_covered(&rel)
+        let already_staged_or_exiting = queue_copy.is_node_covered(tree, node_id)
             || exiting_signal().with_untracked(|exiting| exiting.nodes.contains(&node_id));
         if already_staged_or_exiting {
             continue;
@@ -966,7 +988,7 @@ fn collect_snag_batch(
                     .saturating_add(consolidated_children);
                 result
                     .added
-                    .push((node_id, rel, node.name.clone(), node.total_bytes));
+                    .push((node_id, node.name().to_owned(), node.total_bytes()));
             }
             Ok(SnagOutcome::AlreadyCoveredByAncestor { ancestor }) => {
                 if result.already_covered.is_none() {
@@ -995,15 +1017,18 @@ fn next_surviving_cursor(
         .iter()
         .filter_map(|id| visible.iter().position(|v| v == id))
         .max()?;
-    let after = visible.iter().skip(max_pos + 1).copied().find(|&id| {
-        tree.node(id)
-            .is_some_and(|n| !queue.is_covered(&n.relative_path))
-    });
+    let after = visible
+        .iter()
+        .skip(max_pos + 1)
+        .copied()
+        .find(|&id| tree.node(id).is_some() && !queue.is_node_covered(tree, id));
     after.or_else(|| {
-        visible.iter().take(max_pos).rev().copied().find(|&id| {
-            tree.node(id)
-                .is_some_and(|n| !queue.is_covered(&n.relative_path))
-        })
+        visible
+            .iter()
+            .take(max_pos)
+            .rev()
+            .copied()
+            .find(|&id| tree.node(id).is_some() && !queue.is_node_covered(tree, id))
     })
 }
 
@@ -1038,7 +1063,7 @@ fn emit_snag_notice(outcome: &SnagBatchResult) {
             ),
         );
     } else if outcome.added.len() == 1 {
-        let (_, _, name, bytes) = &outcome.added[0];
+        let (_, name, bytes) = &outcome.added[0];
         let msg = if outcome.consolidated_total > 0 {
             format!(
                 "Snagged `{name}` (consolidated {} child item(s))",
@@ -1049,7 +1074,7 @@ fn emit_snag_notice(outcome: &SnagBatchResult) {
         };
         set_notice(NoticeTone::Info, msg);
     } else {
-        let total_bytes: u64 = outcome.added.iter().map(|(_, _, _, bytes)| *bytes).sum();
+        let total_bytes: u64 = outcome.added.iter().map(|(_, _, bytes)| *bytes).sum();
         set_notice(
             NoticeTone::Info,
             format!(
@@ -1094,15 +1119,13 @@ fn snag_nodes_inner(node_ids: &[NodeId], display_snapshot: Option<&[NodeId]>) {
         )
         .into_iter()
         .filter(|&id| {
-            tree.node(id).is_some_and(|candidate| {
-                outcome
-                    .added
-                    .iter()
-                    .any(|(_, rel, _, _)| candidate.relative_path.starts_with(rel))
-            })
+            outcome
+                .added
+                .iter()
+                .any(|(added_id, _, _)| id == *added_id || tree.is_descendant_of(id, *added_id))
         })
         .collect();
-    for &(id, _, _, _) in &outcome.added {
+    for &(id, _, _) in &outcome.added {
         if !newly_exiting.contains(&id) {
             newly_exiting.push(id);
         }
@@ -1118,9 +1141,8 @@ fn snag_nodes_inner(node_ids: &[NodeId], display_snapshot: Option<&[NodeId]>) {
                 .iter()
                 .copied()
                 .filter(|id| {
-                    tree.node(*id).is_some_and(|n| {
-                        !snag_signal().with_untracked(|s| s.queue.is_covered(&n.relative_path))
-                    })
+                    tree.node(*id).is_some()
+                        && !snag_signal().with_untracked(|s| s.queue.is_node_covered(&tree, *id))
                 })
                 .collect();
             next_surviving_cursor(&tree, &queue_copy, &visible_before, node_ids)
@@ -1163,7 +1185,7 @@ pub(crate) fn unstage_item(relative_path: &Path) {
             exiting_signal().update(|exiting| {
                 exiting.nodes.retain(|&id| {
                     tree.node(id)
-                        .is_none_or(|node| !node.relative_path.starts_with(relative_path))
+                        .is_none_or(|node| !node.relative_path().starts_with(relative_path))
                 });
             });
         }
@@ -1375,7 +1397,7 @@ pub(crate) fn select_node_in_parent(node_id: NodeId) {
     let Some(node) = tree.node(node_id) else {
         return;
     };
-    let parent = node.parent.unwrap_or_else(|| tree.root_id());
+    let parent = node.parent().unwrap_or_else(|| tree.root_id());
     batch(|| {
         browse_signal().update(|browse| {
             browse.current_node = Some(parent);

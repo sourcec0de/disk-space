@@ -1,9 +1,11 @@
-//! Bounded parallel root-jailed filesystem scanner.
+//! Bounded parallel LIFO DFS root-jailed filesystem scanner.
 
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -14,11 +16,10 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use crossbeam_channel::Receiver;
-use crossbeam_channel::Sender;
 use disk_space_platform::DeviceId;
 use disk_space_platform::EntryKind;
 use disk_space_platform::JunkAssessment;
+use disk_space_platform::JunkKind;
 use disk_space_platform::PlatformHost;
 use disk_space_platform::StorageCategory;
 
@@ -26,9 +27,11 @@ use crate::jail::CrossMountPolicy;
 use crate::jail::JailError;
 use crate::jail::ScanRoot;
 use crate::tree::CategoryTotals;
-use crate::tree::DiskNode;
+use crate::tree::CompactNode;
+use crate::tree::DirData;
 use crate::tree::NodeId;
 use crate::tree::StorageTree;
+use crate::tree::encode_modified_secs;
 
 /// Configuration options for [`scan_root`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,10 +101,128 @@ impl ScanCancelHandle {
     }
 }
 
-struct DirTask {
-    node_id: NodeId,
-    abs_path: PathBuf,
-    rel_path: PathBuf,
+struct ScanArena {
+    nodes: Vec<CompactNode>,
+    dirs: Vec<DirData>,
+    name_arena: String,
+}
+
+impl ScanArena {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal helper writes a single node directly into the compact arena"
+    )]
+    fn push_node(
+        &mut self,
+        parent: Option<NodeId>,
+        name: &str,
+        bytes: u64,
+        modified: Option<SystemTime>,
+        kind: EntryKind,
+        category: StorageCategory,
+        junk_kind: Option<JunkKind>,
+        review_first: bool,
+    ) -> NodeId {
+        let id = NodeId::new(self.nodes.len());
+        let name_slice = clamp_name_u16(name);
+        let name_start = self.name_arena.len();
+        self.name_arena.push_str(name_slice);
+        let name_len = u16::try_from(name_slice.len()).unwrap_or(u16::MAX);
+        let mod_secs = encode_modified_secs(modified);
+
+        let aux = if kind == EntryKind::Directory {
+            let dir_idx = u32::try_from(self.dirs.len()).unwrap_or(u32::MAX);
+            self.dirs.push(DirData {
+                modified_secs: mod_secs,
+                ..DirData::default()
+            });
+            dir_idx
+        } else {
+            mod_secs
+        };
+
+        self.nodes.push(CompactNode::new(
+            bytes,
+            parent,
+            name_start,
+            name_len,
+            aux,
+            kind,
+            category,
+            junk_kind,
+            review_first,
+        ));
+        id
+    }
+
+    fn commit_batch(
+        &mut self,
+        parent_id: NodeId,
+        staged_children: Vec<StagedChild>,
+    ) -> Vec<NodeId> {
+        let mut subdir_ids = Vec::new();
+        for child in staged_children {
+            let is_dir = child.kind == EntryKind::Directory;
+            let child_id = self.push_node(
+                Some(parent_id),
+                &child.name,
+                child.own_bytes,
+                child.modified,
+                child.kind,
+                child.category,
+                child.junk_kind,
+                child.review_first,
+            );
+            if is_dir {
+                subdir_ids.push(child_id);
+            }
+        }
+        subdir_ids
+    }
+
+    fn build_abs_path(&self, root_abs: &Path, id: NodeId) -> PathBuf {
+        let mut chain = Vec::new();
+        let mut cursor = Some(id);
+        while let Some(curr) = cursor {
+            if curr == NodeId::new(0) {
+                break;
+            }
+            let Some(node) = self.nodes.get(curr.index()) else {
+                break;
+            };
+            chain.push(node.name_range());
+            cursor = node.parent();
+        }
+        let mut out = root_abs.to_path_buf();
+        for (start, end) in chain.into_iter().rev() {
+            if let Some(seg) = self.name_arena.get(start..end) {
+                out.push(seg);
+            }
+        }
+        out
+    }
+}
+
+fn clamp_name_u16(name: &str) -> &str {
+    let max_len = usize::from(u16::MAX);
+    if name.len() <= max_len {
+        return name;
+    }
+    let mut end = max_len;
+    while !name.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    &name[..end]
+}
+
+struct StagedChild {
+    name: String,
+    kind: EntryKind,
+    own_bytes: u64,
+    modified: Option<SystemTime>,
+    category: StorageCategory,
+    junk_kind: Option<JunkKind>,
+    review_first: bool,
 }
 
 struct SharedScanState<'a> {
@@ -110,7 +231,9 @@ struct SharedScanState<'a> {
     options: &'a ScanOptions,
     cancel: &'a ScanCancelHandle,
     now: SystemTime,
-    nodes: Mutex<Vec<DiskNode>>,
+    arena: Mutex<ScanArena>,
+    work_stack: Mutex<Vec<NodeId>>,
+    work_condvar: Condvar,
     hardlinks: Mutex<HashSet<(DeviceId, u64)>>,
     category_totals: Mutex<CategoryTotals>,
     current_path: Mutex<String>,
@@ -143,31 +266,21 @@ pub fn scan_root(
     let (root_cat, root_junk) =
         host.classify(root.canonical_path(), EntryKind::Directory, &root_meta, now);
 
-    let root_node = DiskNode {
-        id: NodeId::new(0),
-        parent: None,
-        children: Vec::new(),
-        name: root.display_name().to_owned(),
-        name_lower: String::new(),
-        ext_lower: None,
-        rel_path_lower: String::new(),
-        relative_path: PathBuf::new(),
-        kind: EntryKind::Directory,
-        own_bytes: 0,
-        total_bytes: 0,
-        logical_bytes: 0,
-        file_count: 0,
-        dir_count: 1,
-        category: root_cat,
-        category_totals: CategoryTotals::default(),
-        modified: root_meta.modified,
-        accessed: root_meta.accessed,
-        unused_bytes: 0,
-        junk_kind: root_junk.kind,
-        review_first: root_junk.review_first,
-        largest_culprit: None,
-        removed: false,
+    let mut initial_arena = ScanArena {
+        nodes: Vec::with_capacity(4096),
+        dirs: Vec::with_capacity(512),
+        name_arena: String::with_capacity(64 * 1024),
     };
+    let root_id = initial_arena.push_node(
+        None,
+        root.display_name(),
+        0,
+        root_meta.modified,
+        EntryKind::Directory,
+        root_cat,
+        root_junk.kind,
+        root_junk.review_first,
+    );
 
     let state = SharedScanState {
         root: &root,
@@ -175,7 +288,9 @@ pub fn scan_root(
         options,
         cancel,
         now,
-        nodes: Mutex::new(vec![root_node]),
+        arena: Mutex::new(initial_arena),
+        work_stack: Mutex::new(vec![root_id]),
+        work_condvar: Condvar::new(),
         hardlinks: Mutex::new(HashSet::new()),
         category_totals: Mutex::new(CategoryTotals::default()),
         current_path: Mutex::new(root.canonical_path().display().to_string()),
@@ -189,26 +304,14 @@ pub fn scan_root(
         pending_tasks: AtomicUsize::new(1),
     };
 
-    let (tx, rx) = crossbeam_channel::unbounded::<DirTask>();
-    let _ = tx.send(DirTask {
-        node_id: NodeId::new(0),
-        abs_path: root.canonical_path().to_path_buf(),
-        rel_path: PathBuf::new(),
-    });
-
     let worker_count = options.worker_threads.max(1);
     let interval = Duration::from_millis(options.progress_interval_ms.max(20));
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
-            let worker_tx = tx.clone();
-            let worker_rx = rx.clone();
             let state_ref = &state;
-            scope.spawn(move || worker_loop(state_ref, &worker_tx, &worker_rx));
+            scope.spawn(move || worker_loop(state_ref));
         }
-
-        drop(tx);
-        drop(rx);
 
         let mut last_emit = Instant::now();
         while state.pending_tasks.load(Ordering::Acquire) > 0 && !cancel.is_cancelled() {
@@ -217,6 +320,9 @@ pub fn scan_root(
                 on_progress(snapshot_progress(&state));
                 last_emit = Instant::now();
             }
+        }
+        if cancel.is_cancelled() {
+            state.work_condvar.notify_all();
         }
     });
 
@@ -230,15 +336,29 @@ pub fn scan_root(
     let skipped_symlinks = state.skipped_symlinks.load(Ordering::Relaxed);
     let skipped_cross_mount = state.skipped_cross_mount.load(Ordering::Relaxed);
     let hardlink_savings = state.hardlink_savings.load(Ordering::Relaxed);
-    let nodes = state
-        .nodes
+    let SharedScanState {
+        arena,
+        work_stack,
+        hardlinks,
+        category_totals,
+        current_path,
+        ..
+    } = state;
+    drop(work_stack);
+    drop(hardlinks);
+    drop(category_totals);
+    drop(current_path);
+
+    let extracted = arena
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     Ok(StorageTree::from_raw(
         root,
         volume,
-        nodes,
+        extracted.nodes,
+        extracted.dirs,
+        extracted.name_arena,
         unreadable_dirs,
         skipped_symlinks,
         skipped_cross_mount,
@@ -247,36 +367,66 @@ pub fn scan_root(
     ))
 }
 
-fn worker_loop(state: &SharedScanState<'_>, tx: &Sender<DirTask>, rx: &Receiver<DirTask>) {
+fn worker_loop(state: &SharedScanState<'_>) {
     loop {
-        if state.cancel.is_cancelled() || state.pending_tasks.load(Ordering::Acquire) == 0 {
+        if state.cancel.is_cancelled() {
             break;
         }
-        match rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(task) => {
-                process_directory(state, tx, &task);
-                if state.pending_tasks.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    break;
+        let next_dir = {
+            let mut stack = state
+                .work_stack
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if let Some(dir_id) = stack.pop() {
+                    break Some(dir_id);
                 }
+                if state.cancel.is_cancelled() || state.pending_tasks.load(Ordering::Acquire) == 0 {
+                    break None;
+                }
+                let (guard, _) = state
+                    .work_condvar
+                    .wait_timeout(stack, Duration::from_millis(25))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                stack = guard;
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let Some(dir_id) = next_dir else {
+            break;
+        };
+        process_directory(state, dir_id);
+        if state.pending_tasks.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _guard = state.work_stack.lock();
+            state.work_condvar.notify_all();
+            break;
         }
     }
 }
 
-fn process_directory(state: &SharedScanState<'_>, tx: &Sender<DirTask>, task: &DirTask) {
-    if let Ok(mut current) = state.current_path.lock() {
-        *current = task.abs_path.display().to_string();
+fn process_directory(state: &SharedScanState<'_>, dir_id: NodeId) {
+    let abs_path = {
+        let arena = state
+            .arena
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arena.build_abs_path(state.root.canonical_path(), dir_id)
+    };
+
+    if let Ok(mut current) = state.current_path.try_lock() {
+        *current = abs_path.display().to_string();
     }
 
-    let Ok(entries) = fs::read_dir(&task.abs_path) else {
+    let Ok(entries) = fs::read_dir(&abs_path) else {
         state.unreadable_dirs.fetch_add(1, Ordering::Relaxed);
         return;
     };
 
-    let mut staged_children: Vec<DiskNode> = Vec::new();
-    let mut subdirs_to_queue: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+    let mut staged_children: Vec<StagedChild> = Vec::new();
+    let mut local_files = 0_u64;
+    let mut local_dirs = 0_u64;
+    let mut local_bytes = 0_u64;
+    let mut local_cat_totals = CategoryTotals::default();
 
     for entry_result in entries {
         if state.cancel.is_cancelled() {
@@ -288,22 +438,43 @@ fn process_directory(state: &SharedScanState<'_>, tx: &Sender<DirTask>, task: &D
         };
         inspect_dir_entry(
             state,
-            task,
             &entry,
             &mut staged_children,
-            &mut subdirs_to_queue,
+            &mut local_files,
+            &mut local_dirs,
+            &mut local_bytes,
+            &mut local_cat_totals,
         );
     }
 
-    commit_directory_children(state, tx, task.node_id, staged_children, subdirs_to_queue);
+    if local_files > 0 {
+        state
+            .scanned_files
+            .fetch_add(local_files, Ordering::Relaxed);
+    }
+    if local_dirs > 0 {
+        state.scanned_dirs.fetch_add(local_dirs, Ordering::Relaxed);
+    }
+    if local_bytes > 0 {
+        state
+            .scanned_bytes
+            .fetch_add(local_bytes, Ordering::Relaxed);
+        if let Ok(mut totals) = state.category_totals.lock() {
+            totals.add_all(&local_cat_totals);
+        }
+    }
+
+    commit_directory_children(state, dir_id, staged_children);
 }
 
 fn inspect_dir_entry(
     state: &SharedScanState<'_>,
-    parent_task: &DirTask,
     entry: &fs::DirEntry,
-    staged_children: &mut Vec<DiskNode>,
-    subdirs_to_queue: &mut Vec<(usize, PathBuf, PathBuf)>,
+    staged_children: &mut Vec<StagedChild>,
+    local_files: &mut u64,
+    local_dirs: &mut u64,
+    local_bytes: &mut u64,
+    local_cat_totals: &mut CategoryTotals,
 ) {
     let child_abs = entry.path();
     if state
@@ -331,49 +502,28 @@ fn inspect_dir_entry(
     }
 
     let child_name = entry.file_name().to_string_lossy().into_owned();
-    let child_rel = parent_task.rel_path.join(&child_name);
-
     let (cat, junk): (StorageCategory, JunkAssessment) =
         state.host.classify(&child_abs, meta.kind, &meta, state.now);
-
     let own_bytes = compute_allocated_bytes(state, &meta);
 
     if meta.kind == EntryKind::Directory {
-        state.scanned_dirs.fetch_add(1, Ordering::Relaxed);
-        let local_idx = staged_children.len();
-        subdirs_to_queue.push((local_idx, child_abs, child_rel.clone()));
+        *local_dirs = local_dirs.saturating_add(1);
     } else {
-        state.scanned_files.fetch_add(1, Ordering::Relaxed);
-        state.scanned_bytes.fetch_add(own_bytes, Ordering::Relaxed);
-        if let Ok(mut totals) = state.category_totals.lock() {
-            totals.add(cat, own_bytes);
+        *local_files = local_files.saturating_add(1);
+        *local_bytes = local_bytes.saturating_add(own_bytes);
+        if own_bytes > 0 {
+            local_cat_totals.add(cat, own_bytes);
         }
     }
 
-    staged_children.push(DiskNode {
-        id: NodeId::new(0),
-        parent: Some(parent_task.node_id),
-        children: Vec::new(),
+    staged_children.push(StagedChild {
         name: child_name,
-        name_lower: String::new(),
-        ext_lower: None,
-        rel_path_lower: String::new(),
-        relative_path: child_rel,
         kind: meta.kind,
         own_bytes,
-        total_bytes: own_bytes,
-        logical_bytes: meta.logical_bytes,
-        file_count: u64::from(meta.kind == EntryKind::File),
-        dir_count: u64::from(meta.kind == EntryKind::Directory),
-        category: cat,
-        category_totals: CategoryTotals::default(),
         modified: meta.modified,
-        accessed: meta.accessed,
-        unused_bytes: if junk.kind.is_some() { own_bytes } else { 0 },
+        category: cat,
         junk_kind: junk.kind,
         review_first: junk.review_first,
-        largest_culprit: None,
-        removed: false,
     });
 }
 
@@ -404,48 +554,29 @@ fn compute_allocated_bytes(
 
 fn commit_directory_children(
     state: &SharedScanState<'_>,
-    tx: &Sender<DirTask>,
     parent_id: NodeId,
-    staged_children: Vec<DiskNode>,
-    subdirs_to_queue: Vec<(usize, PathBuf, PathBuf)>,
+    staged_children: Vec<StagedChild>,
 ) {
     if staged_children.is_empty() {
         return;
     }
 
-    let mut queued_tasks = Vec::with_capacity(subdirs_to_queue.len());
-    let mut nodes = state
-        .nodes
+    let subdir_ids = state
+        .arena
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let base_idx = nodes.len();
-    let mut child_ids = Vec::with_capacity(staged_children.len());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .commit_batch(parent_id, staged_children);
 
-    for (offset, mut child_node) in staged_children.into_iter().enumerate() {
-        let new_id = NodeId::new(base_idx + offset);
-        child_node.id = new_id;
-        child_ids.push(new_id);
-        nodes.push(child_node);
-    }
-
-    nodes[parent_id.index()].children.extend(child_ids);
-    drop(nodes);
-
-    for (local_idx, abs_path, rel_path) in subdirs_to_queue {
-        queued_tasks.push(DirTask {
-            node_id: NodeId::new(base_idx + local_idx),
-            abs_path,
-            rel_path,
-        });
-    }
-
-    if !queued_tasks.is_empty() {
+    if !subdir_ids.is_empty() {
         state
             .pending_tasks
-            .fetch_add(queued_tasks.len(), Ordering::AcqRel);
-        for subdir in queued_tasks {
-            let _ = tx.send(subdir);
-        }
+            .fetch_add(subdir_ids.len(), Ordering::AcqRel);
+        state
+            .work_stack
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(subdir_ids.into_iter().rev());
+        state.work_condvar.notify_all();
     }
 }
 
@@ -525,15 +656,15 @@ mod tests {
         assert!(tree.hardlink_savings_bytes() > 0);
 
         let root_node = tree.node(tree.root_id()).expect("root node");
-        assert!(root_node.total_bytes < 65_536);
-        assert!(root_node.largest_culprit.is_some());
+        assert!(root_node.total_bytes() < 65_536);
+        assert!(root_node.largest_culprit().is_some());
 
         // Pruning removes cache entry and drops root bytes cleanly.
-        let before = root_node.total_bytes;
+        let before = root_node.total_bytes();
         let rel = PathBuf::from("Library/Caches/TestApp/blob_hardlink.cache");
         let rel_orig = PathBuf::from("Library/Caches/TestApp/blob.cache");
         tree.prune_deleted(&[rel, rel_orig]);
-        let after = tree.node(tree.root_id()).expect("root node").total_bytes;
+        let after = tree.node(tree.root_id()).expect("root node").total_bytes();
         assert!(after < before);
     }
 

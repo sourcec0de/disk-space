@@ -1,13 +1,13 @@
 //! Search, filtering, sorting, and storage aggregation across a [`StorageTree`].
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::path::Path;
 
 use disk_space_platform::EntryKind;
 use disk_space_platform::StorageCategory;
 
-use crate::tree::DiskNode;
 use crate::tree::NodeId;
+use crate::tree::NodeRef;
 use crate::tree::StorageTree;
 
 /// Maximum search hits returned to keep the UI responsive on massive trees.
@@ -84,9 +84,43 @@ pub struct AggregateReport {
 /// Searches `tree` according to `query` and returns up to [`MAX_SEARCH_RESULTS`] sorted [`NodeId`]s.
 #[must_use]
 pub fn search_tree(tree: &StorageTree, query: &SearchQuery) -> Vec<NodeId> {
-    let mut matches = search_tree_all(tree, query, None);
-    truncate_and_sort_nodes(tree, &mut matches, query.sort, MAX_SEARCH_RESULTS);
-    matches
+    search_tree_bounded(tree, query, None, MAX_SEARCH_RESULTS, 0).0
+}
+
+/// Searches `tree` (or `candidates`) keeping bounded `O(limit)` heap memory for top hits,
+/// plus an optional candidate cache capped at `max_cache` entries (`0` disables caching).
+#[must_use]
+pub fn search_tree_bounded(
+    tree: &StorageTree,
+    query: &SearchQuery,
+    candidates: Option<&[NodeId]>,
+    limit: usize,
+    max_cache: usize,
+) -> (Vec<NodeId>, Option<Vec<NodeId>>) {
+    let mut top = Vec::new();
+    let watermark = limit.saturating_mul(2).max(limit).saturating_add(64);
+    let mut cache_all = (max_cache > 0).then(Vec::new);
+
+    visit_matching_nodes(tree, query, candidates, |node| {
+        let id = node.id();
+        if let Some(cache) = cache_all.as_mut() {
+            if cache.len() < max_cache {
+                cache.push(id);
+            } else {
+                cache_all = None;
+            }
+        }
+        if limit > 0 {
+            top.push(id);
+            if top.len() >= watermark {
+                top.select_nth_unstable_by(limit, |&a, &b| compare_nodes(tree, a, b, query.sort));
+                top.truncate(limit);
+            }
+        }
+    });
+
+    truncate_and_sort_nodes(tree, &mut top, query.sort, limit);
+    (top, cache_all)
 }
 
 /// Searches `tree` (or an explicit slice of `candidates`) according to `query` and returns all
@@ -97,59 +131,73 @@ pub fn search_tree_all(
     query: &SearchQuery,
     candidates: Option<&[NodeId]>,
 ) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    visit_matching_nodes(tree, query, candidates, |node| out.push(node.id()));
+    out
+}
+
+fn visit_matching_nodes<'a>(
+    tree: &'a StorageTree,
+    query: &SearchQuery,
+    candidates: Option<&[NodeId]>,
+    mut on_match: impl FnMut(NodeRef<'a>),
+) {
     let normalized = NormalizedQuery::new(&query.text);
     let filter = normalized.filter();
-    let scope_prefix = query
-        .scope_node
-        .and_then(|id| tree.node(id))
-        .map(|node| node.relative_path.as_path());
     let root_id = tree.root_id();
+    let scope_id = query
+        .scope_node
+        .filter(|&id| id != root_id && tree.node(id).is_some());
 
-    let matches_criteria = |node: &DiskNode| -> bool {
-        if node.id == root_id {
-            return false;
-        }
-        if let Some(prefix) = scope_prefix
-            && !prefix.as_os_str().is_empty()
-            && !(node.relative_path.starts_with(prefix) && node.relative_path.as_path() != prefix)
-        {
-            return false;
-        }
-        if query
-            .category
-            .is_some_and(|cat| node.category != cat && node.category_totals.get(cat) == 0)
-        {
-            return false;
-        }
-        match query.filter_mode {
-            FilterMode::All => {}
-            FilterMode::JunkAndUnusedOnly => {
-                if node.junk_kind.is_none() && node.unused_bytes == 0 {
-                    return false;
-                }
+    if let Some(ids) = candidates {
+        for &id in ids {
+            if let Some(node) = tree.node(id)
+                && node.id() != root_id
+                && scope_id.is_none_or(|scope| tree.is_descendant_of(node.id(), scope))
+                && node_matches_query(tree, node, query, filter)
+            {
+                on_match(node);
             }
         }
-        if query.min_bytes.is_some_and(|min| node.total_bytes < min) {
-            return false;
+    } else if let Some(scope) = scope_id {
+        for node in tree.subtree_iter(scope) {
+            if node.id() != root_id && node_matches_query(tree, node, query, filter) {
+                on_match(node);
+            }
         }
-        matches_parsed(node, filter)
-    };
+    } else {
+        for node in tree.active_nodes() {
+            if node.id() != root_id && node_matches_query(tree, node, query, filter) {
+                on_match(node);
+            }
+        }
+    }
+}
 
-    candidates.map_or_else(
-        || {
-            tree.active_nodes()
-                .filter(|node| matches_criteria(node))
-                .map(|node| node.id)
-                .collect()
-        },
-        |ids| {
-            ids.iter()
-                .filter_map(|id| tree.node(*id))
-                .filter(|node| matches_criteria(node))
-                .map(|node| node.id)
-                .collect()
-        },
-    )
+fn node_matches_query(
+    tree: &StorageTree,
+    node: NodeRef<'_>,
+    query: &SearchQuery,
+    filter: QueryFilter<'_>,
+) -> bool {
+    if query
+        .category
+        .is_some_and(|cat| node.category() != cat && node.category_bytes(cat) == 0)
+    {
+        return false;
+    }
+    match query.filter_mode {
+        FilterMode::All => {}
+        FilterMode::JunkAndUnusedOnly => {
+            if node.junk_kind().is_none() && node.unused_bytes() == 0 {
+                return false;
+            }
+        }
+    }
+    if query.min_bytes.is_some_and(|min| node.total_bytes() < min) {
+        return false;
+    }
+    matches_parsed(tree, node, filter)
 }
 
 /// Keeps at most `limit` top [`NodeId`]s ordered by `order` using `select_nth_unstable_by`
@@ -176,77 +224,79 @@ pub fn sort_nodes(tree: &StorageTree, ids: &mut [NodeId], order: SortOrder) {
     ids.sort_by(|&a, &b| compare_nodes(tree, a, b, order));
 }
 
-fn compare_nodes(
-    tree: &StorageTree,
-    a_id: NodeId,
-    b_id: NodeId,
-    order: SortOrder,
-) -> std::cmp::Ordering {
+fn compare_nodes(tree: &StorageTree, a_id: NodeId, b_id: NodeId, order: SortOrder) -> Ordering {
     let Some(a) = tree.node(a_id) else {
-        return std::cmp::Ordering::Greater;
+        return Ordering::Greater;
     };
     let Some(b) = tree.node(b_id) else {
-        return std::cmp::Ordering::Less;
+        return Ordering::Less;
     };
     match order {
         SortOrder::SizeDesc => b
-            .total_bytes
-            .cmp(&a.total_bytes)
-            .then_with(|| a.name.cmp(&b.name)),
+            .total_bytes()
+            .cmp(&a.total_bytes())
+            .then_with(|| a.name().cmp(b.name())),
         SortOrder::AgeOldestFirst => a
-            .modified
-            .cmp(&b.modified)
-            .then_with(|| b.total_bytes.cmp(&a.total_bytes)),
-        SortOrder::NameAsc => a
-            .name_lower
-            .cmp(&b.name_lower)
-            .then_with(|| a.name.cmp(&b.name)),
+            .modified_secs()
+            .cmp(&b.modified_secs())
+            .then_with(|| b.total_bytes().cmp(&a.total_bytes())),
+        SortOrder::NameAsc => cmp_ascii_ci(a.name(), b.name()),
     }
 }
 
 /// Computes extension, top-folder, and junk-cluster aggregations within `scope`.
 #[must_use]
 pub fn compute_aggregates(tree: &StorageTree, scope: NodeId, limit: usize) -> AggregateReport {
-    let scope_prefix = tree
-        .node(scope)
-        .map_or_else(|| Path::new(""), |node| node.relative_path.as_path());
-
     let mut ext_map: HashMap<String, (u64, u64, NodeId, u64)> = HashMap::new();
     let mut folders = Vec::new();
     let mut junk = Vec::new();
+    let watermark = limit.saturating_mul(2).max(limit).saturating_add(64);
+    let root_id = tree.root_id();
 
-    for node in tree.active_nodes() {
-        if node.id == tree.root_id() || node.id == scope {
-            continue;
+    let mut accumulate = |node: NodeRef<'_>| {
+        if node.kind() == EntryKind::Directory {
+            if node.total_bytes() > 0 && limit > 0 {
+                folders.push(node.id());
+                if folders.len() >= watermark {
+                    folders.select_nth_unstable_by(limit, |&a, &b| {
+                        compare_nodes(tree, a, b, SortOrder::SizeDesc)
+                    });
+                    folders.truncate(limit);
+                }
+            }
+            if node.junk_kind().is_some() && node.total_bytes() > 0 && limit > 0 {
+                junk.push(node.id());
+                if junk.len() >= watermark {
+                    junk.select_nth_unstable_by(limit, |&a, &b| {
+                        compare_nodes(tree, a, b, SortOrder::SizeDesc)
+                    });
+                    junk.truncate(limit);
+                }
+            }
+        } else if node.kind() == EntryKind::File {
+            let own = node.own_bytes();
+            update_extension_aggregate(&mut ext_map, node.extension(), node.id(), own);
+            if node.junk_kind().is_some() && own > 0 && limit > 0 {
+                junk.push(node.id());
+                if junk.len() >= watermark {
+                    junk.select_nth_unstable_by(limit, |&a, &b| {
+                        compare_nodes(tree, a, b, SortOrder::SizeDesc)
+                    });
+                    junk.truncate(limit);
+                }
+            }
         }
-        if !scope_prefix.as_os_str().is_empty() && !node.relative_path.starts_with(scope_prefix) {
-            continue;
-        }
+    };
 
-        if node.kind == EntryKind::Directory {
-            if node.total_bytes > 0 {
-                folders.push(node.id);
+    if scope == root_id {
+        for node in tree.active_nodes() {
+            if node.id() != root_id {
+                accumulate(node);
             }
-            if node.junk_kind.is_some() && node.total_bytes > 0 {
-                junk.push(node.id);
-            }
-        } else if node.kind == EntryKind::File {
-            let ext = node
-                .ext_lower
-                .as_deref()
-                .map_or_else(|| "(no ext)".to_owned(), str::to_owned);
-            let entry = ext_map
-                .entry(ext)
-                .or_insert((0, 0, node.id, node.own_bytes));
-            entry.0 = entry.0.saturating_add(node.own_bytes);
-            entry.1 = entry.1.saturating_add(1);
-            if node.own_bytes > entry.3 {
-                entry.2 = node.id;
-                entry.3 = node.own_bytes;
-            }
-            if node.junk_kind.is_some() && node.own_bytes > 0 {
-                junk.push(node.id);
-            }
+        }
+    } else {
+        for node in tree.subtree_iter(scope) {
+            accumulate(node);
         }
     }
 
@@ -261,14 +311,16 @@ pub fn compute_aggregates(tree: &StorageTree, scope: NodeId, limit: usize) -> Ag
             },
         )
         .collect();
+    if by_extension.len() > limit && limit > 0 {
+        by_extension.select_nth_unstable_by(limit, |a, b| b.total_bytes.cmp(&a.total_bytes));
+        by_extension.truncate(limit);
+    } else if limit == 0 {
+        by_extension.clear();
+    }
     by_extension.sort_by_key(|ext| std::cmp::Reverse(ext.total_bytes));
-    by_extension.truncate(limit);
 
-    sort_nodes(tree, &mut folders, SortOrder::SizeDesc);
-    folders.truncate(limit);
-
-    sort_nodes(tree, &mut junk, SortOrder::SizeDesc);
-    junk.truncate(limit);
+    truncate_and_sort_nodes(tree, &mut folders, SortOrder::SizeDesc, limit);
+    truncate_and_sort_nodes(tree, &mut junk, SortOrder::SizeDesc, limit);
 
     AggregateReport {
         by_extension,
@@ -277,12 +329,46 @@ pub fn compute_aggregates(tree: &StorageTree, scope: NodeId, limit: usize) -> Ag
     }
 }
 
+fn update_extension_aggregate(
+    ext_map: &mut HashMap<String, (u64, u64, NodeId, u64)>,
+    raw_ext: Option<&str>,
+    node_id: NodeId,
+    own_bytes: u64,
+) {
+    let mut stack_buf = [0_u8; 32];
+    let owned_fallback;
+    let key: &str = match raw_ext {
+        None => "(no ext)",
+        Some(raw) if raw.len() <= stack_buf.len() => {
+            for (dst, &src) in stack_buf.iter_mut().zip(raw.as_bytes()) {
+                *dst = src.to_ascii_lowercase();
+            }
+            std::str::from_utf8(&stack_buf[..raw.len()]).unwrap_or(raw)
+        }
+        Some(raw) => {
+            owned_fallback = raw.to_ascii_lowercase();
+            &owned_fallback
+        }
+    };
+
+    if let Some(entry) = ext_map.get_mut(key) {
+        entry.0 = entry.0.saturating_add(own_bytes);
+        entry.1 = entry.1.saturating_add(1);
+        if own_bytes > entry.3 {
+            entry.2 = node_id;
+            entry.3 = own_bytes;
+        }
+    } else {
+        ext_map.insert(key.to_owned(), (own_bytes, 1, node_id, own_bytes));
+    }
+}
+
 #[derive(Clone, Copy)]
 enum QueryFilter<'a> {
     Empty,
     Extension(&'a str),
     Name(&'a str),
-    Subpath(&'a str),
+    Subpath(&'a str, &'a str),
 }
 
 struct NormalizedQuery {
@@ -314,30 +400,93 @@ impl NormalizedQuery {
         let clean = trimmed.trim_matches('/');
         if clean.is_empty() {
             QueryFilter::Empty
-        } else if clean.contains('/') {
-            QueryFilter::Subpath(clean)
+        } else if let Some((parent_part, name_part)) = clean.rsplit_once('/') {
+            QueryFilter::Subpath(parent_part, name_part)
         } else {
             QueryFilter::Name(clean)
         }
     }
 }
 
-fn matches_parsed(node: &DiskNode, filter: QueryFilter<'_>) -> bool {
+fn matches_parsed(tree: &StorageTree, node: NodeRef<'_>, filter: QueryFilter<'_>) -> bool {
     match filter {
         QueryFilter::Empty => true,
-        QueryFilter::Extension(ext_query) => node.ext_lower.as_deref() == Some(ext_query),
-        QueryFilter::Name(clean) => node.name_lower.contains(clean),
-        QueryFilter::Subpath(clean) => {
-            // Explicit subpath queries must extend into the entry's own name, never match only an ancestor.
-            let name_start = node
-                .rel_path_lower
-                .len()
-                .saturating_sub(node.name_lower.len());
-            node.rel_path_lower
-                .rfind(clean)
-                .is_some_and(|pos| pos.saturating_add(clean.len()) > name_start)
+        QueryFilter::Extension(ext_query) => node
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(ext_query)),
+        QueryFilter::Name(clean) => contains_ascii_ci(node.name(), clean),
+        QueryFilter::Subpath(parent_part, name_part) => {
+            let Some(parent_id) = node.parent() else {
+                return false;
+            };
+            if parent_id == tree.root_id() {
+                return false;
+            }
+            starts_with_ascii_ci(node.name(), name_part)
+                && ancestors_end_with_ascii_ci(tree, parent_id, parent_part.as_bytes())
         }
     }
+}
+
+fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    let Some(&first) = n.first() else {
+        return true;
+    };
+    if n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len())
+        .any(|w| w[0].to_ascii_lowercase() == first && w.eq_ignore_ascii_case(n))
+}
+
+fn starts_with_ascii_ci(haystack: &str, prefix_lower: &str) -> bool {
+    let h = haystack.as_bytes();
+    let p = prefix_lower.as_bytes();
+    h.get(..p.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(p))
+}
+
+fn ancestors_end_with_ascii_ci(
+    tree: &StorageTree,
+    mut parent_id: NodeId,
+    mut remaining: &[u8],
+) -> bool {
+    let root_id = tree.root_id();
+    while !remaining.is_empty() {
+        if parent_id == root_id {
+            return false;
+        }
+        let Some(parent) = tree.node(parent_id) else {
+            return false;
+        };
+        let pname = parent.name().as_bytes();
+        if let Some(slash_pos) = remaining.iter().rposition(|&b| b == b'/') {
+            let seg = &remaining[slash_pos + 1..];
+            if !pname.eq_ignore_ascii_case(seg) {
+                return false;
+            }
+            remaining = &remaining[..slash_pos];
+            let Some(next_parent) = parent.parent() else {
+                return false;
+            };
+            parent_id = next_parent;
+        } else {
+            return pname
+                .len()
+                .checked_sub(remaining.len())
+                .is_some_and(|start| pname[start..].eq_ignore_ascii_case(remaining));
+        }
+    }
+    true
+}
+
+fn cmp_ascii_ci(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
+        .then_with(|| a.cmp(b))
 }
 
 #[cfg(test)]
@@ -382,7 +531,7 @@ mod tests {
             },
         );
         assert_eq!(log_hits.len(), 1);
-        assert_eq!(tree.node(log_hits[0]).expect("hit").name, "old.log");
+        assert_eq!(tree.node(log_hits[0]).expect("hit").name(), "old.log");
 
         let junk_hits = search_tree(
             &tree,
@@ -394,7 +543,7 @@ mod tests {
         assert!(
             junk_hits
                 .iter()
-                .any(|id| tree.node(*id).is_some_and(|n| n.name == "old.log"))
+                .any(|id| tree.node(*id).is_some_and(|n| n.name() == "old.log"))
         );
 
         let agg = compute_aggregates(&tree, tree.root_id(), 10);
@@ -444,7 +593,7 @@ mod tests {
         );
         let hit_names: Vec<&str> = hits
             .iter()
-            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .filter_map(|id| tree.node(*id).map(NodeRef::name))
             .collect();
         assert_eq!(
             hit_names,
@@ -466,7 +615,7 @@ mod tests {
         );
         let webm_names: Vec<&str> = webm_hits
             .iter()
-            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .filter_map(|id| tree.node(*id).map(NodeRef::name))
             .collect();
         assert_eq!(webm_names, vec!["8a4f9c.webm"]);
 
@@ -479,9 +628,31 @@ mod tests {
         );
         let subpath_names: Vec<&str> = subpath_hits
             .iter()
-            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .filter_map(|id| tree.node(*id).map(NodeRef::name))
             .collect();
         assert_eq!(subpath_names, vec!["data"]);
+
+        let deep_subpath = search_tree(
+            &tree,
+            &SearchQuery {
+                text: "REPORT-CORE/Data/8a4f".to_owned(),
+                ..SearchQuery::default()
+            },
+        );
+        let deep_names: Vec<&str> = deep_subpath
+            .iter()
+            .filter_map(|id| tree.node(*id).map(NodeRef::name))
+            .collect();
+        assert_eq!(deep_names, vec!["8a4f9c.webm"]);
+
+        let ancestor_only = search_tree(
+            &tree,
+            &SearchQuery {
+                text: "playwright-report-core/other".to_owned(),
+                ..SearchQuery::default()
+            },
+        );
+        assert!(ancestor_only.is_empty());
     }
 
     #[test]
@@ -528,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_and_sort_nodes_keeps_exact_top_n() {
+    fn truncate_and_sort_nodes_keeps_exact_top_n_and_bounded_search_respects_cache_cap() {
         let outer = tempfile::tempdir().expect("tempdir");
         let root_dir = outer.path().join("many");
         fs::create_dir_all(&root_dir).expect("mkdir");
@@ -557,11 +728,21 @@ mod tests {
         truncate_and_sort_nodes(&tree, &mut ids, SortOrder::SizeDesc, 4);
         let names: Vec<&str> = ids
             .iter()
-            .filter_map(|id| tree.node(*id).map(|n| n.name.as_str()))
+            .filter_map(|id| tree.node(*id).map(NodeRef::name))
             .collect();
         assert_eq!(
             names,
             vec!["item_12.dat", "item_11.dat", "item_10.dat", "item_09.dat"]
         );
+
+        let (bounded_top, small_cache) =
+            search_tree_bounded(&tree, &SearchQuery::default(), None, 4, 20);
+        assert_eq!(bounded_top, ids);
+        assert_eq!(small_cache.as_ref().map(Vec::len), Some(12));
+
+        let (bounded_uncached, overflow_cache) =
+            search_tree_bounded(&tree, &SearchQuery::default(), None, 4, 5);
+        assert_eq!(bounded_uncached, ids);
+        assert!(overflow_cache.is_none());
     }
 }

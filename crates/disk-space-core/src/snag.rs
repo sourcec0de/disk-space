@@ -16,8 +16,9 @@ use disk_space_platform::StorageCategory;
 use crate::jail::JailError;
 use crate::jail::JailedPath;
 use crate::jail::ScanRoot;
-use crate::tree::DiskNode;
 use crate::tree::NodeId;
+use crate::tree::NodeRef;
+use crate::tree::StorageTree;
 
 /// Chunk buffer size (64 KiB) used for overwriting regular files during secure erasure.
 const WIPE_CHUNK_BYTES: usize = 65_536;
@@ -132,13 +133,14 @@ impl SnagQueue {
     pub fn snag(
         &mut self,
         root: &ScanRoot,
-        node: &DiskNode,
+        node: NodeRef<'_>,
         host: &dyn PlatformHost,
     ) -> Result<SnagOutcome, JailError> {
-        let candidate = if node.relative_path.as_os_str().is_empty() {
+        let rel_path = node.relative_path();
+        let candidate = if rel_path.as_os_str().is_empty() {
             root.canonical_path().to_path_buf()
         } else {
-            root.canonical_path().join(&node.relative_path)
+            root.canonical_path().join(&rel_path)
         };
         let jailed = root.jail_for_destruction(&candidate, host)?;
         let rel = jailed.relative_path();
@@ -161,11 +163,11 @@ impl SnagQueue {
         let consolidated_children = before_len.saturating_sub(self.items.len());
 
         self.items.push(SnagItem {
-            node_id: node.id,
+            node_id: node.id(),
             jailed_path: jailed,
-            bytes: node.total_bytes,
-            kind: node.kind,
-            category: node.category,
+            bytes: node.total_bytes(),
+            kind: node.kind(),
+            category: node.category(),
         });
 
         Ok(SnagOutcome::Added {
@@ -212,6 +214,22 @@ impl SnagQueue {
         self.items
             .iter()
             .any(|item| relative_path.starts_with(item.jailed_path.relative_path()))
+    }
+
+    /// Zero-allocation check returning `true` if `node_id` or any ancestor in `tree` is staged.
+    #[must_use]
+    pub fn is_node_covered(&self, tree: &StorageTree, node_id: NodeId) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        let mut cursor = Some(node_id);
+        while let Some(curr) = cursor {
+            if self.items.iter().any(|item| item.node_id == curr) {
+                return true;
+            }
+            cursor = tree.parent_of(curr);
+        }
+        false
     }
 }
 

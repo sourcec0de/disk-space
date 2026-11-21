@@ -1,14 +1,13 @@
 //! Main explorer pane: breadcrumbs, search & junk filters, virtualized accessible listbox, and aggregates.
 
 use std::cell::Cell;
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use disk_space_core::AgeFreshness;
-use disk_space_core::DiskNode;
 use disk_space_core::FilterMode;
 use disk_space_core::NodeId;
+use disk_space_core::NodeRef;
 use disk_space_core::SortOrder;
 use disk_space_core::StorageTree;
 use disk_space_core::compute_aggregates;
@@ -188,12 +187,12 @@ impl ExplorerController {
         let msg = if count > 1 {
             format!(
                 "{}, {}, {} selected",
-                node.name,
-                format_bytes(node.total_bytes),
+                node.name(),
+                format_bytes(node.total_bytes()),
                 count
             )
         } else {
-            format!("{}, {}", node.name, format_bytes(node.total_bytes))
+            format!("{}, {}", node.name(), format_bytes(node.total_bytes()))
         };
         announce_for_accessibility(msg);
     }
@@ -557,18 +556,18 @@ fn build_top_header(
     let (header_bytes, review_first) = match (current_node, selected_category) {
         (None, Some(cat)) => {
             let root_node = tree.node(tree.root_id());
-            (root_node.map_or(0, |n| n.category_totals.get(cat)), false)
+            (root_node.map_or(0, |n| n.category_bytes(cat)), false)
         }
         _ => (
-            header_node.map_or(0, |n| n.total_bytes),
-            header_node.is_some_and(|n| n.review_first),
+            header_node.map_or(0, NodeRef::total_bytes),
+            header_node.is_some_and(NodeRef::review_first),
         ),
     };
 
     let vol_total = tree.volume().total_bytes.max(1);
     let pct_of_disk = header_bytes.saturating_mul(100) / vol_total;
     let active_accent = selected_category
-        .or_else(|| header_node.map(|n| n.category))
+        .or_else(|| header_node.map(NodeRef::category))
         .map_or(palette::TEXT_PRIMARY, palette::category_color);
 
     let subtitle_path = match (current_node, selected_category) {
@@ -731,9 +730,9 @@ fn build_filter_strip(
             .category_entries(cat)
             .iter()
             .filter_map(|id| tree.node(*id))
-            .map(|n| n.unused_bytes)
+            .map(NodeRef::unused_bytes)
             .sum(),
-        _ => tree.node(header_node_id).map_or(0, |n| n.unused_bytes),
+        _ => tree.node(header_node_id).map_or(0, NodeRef::unused_bytes),
     };
 
     let junk_only = filter_mode == FilterMode::JunkAndUnusedOnly;
@@ -864,7 +863,7 @@ fn build_breadcrumbs(
                 }
                 if let Some(node) = tree.node(id) {
                     let is_last = idx + 1 == chain.len();
-                    crumbs.push((format!("/{}", node.name), Some(id), is_last));
+                    crumbs.push((format!("/{}", node.name()), Some(id), is_last));
                 }
             }
         }
@@ -873,9 +872,9 @@ fn build_breadcrumbs(
             for (idx, id) in chain.iter().copied().enumerate() {
                 if let Some(node) = tree.node(id) {
                     let label = if idx == 0 {
-                        node.name.clone()
+                        node.name().to_owned()
                     } else {
-                        format!("/{}", node.name)
+                        format!("/{}", node.name())
                     };
                     let is_last = idx + 1 == chain.len();
                     crumbs.push((label, Some(id), is_last));
@@ -885,7 +884,7 @@ fn build_breadcrumbs(
         (None, None) => {
             let root_name = tree
                 .node(tree.root_id())
-                .map_or_else(|| "root".to_owned(), |n| n.name.clone());
+                .map_or_else(|| "root".to_owned(), |n| n.name().to_owned());
             crumbs.push((root_name, None, true));
         }
     }
@@ -990,7 +989,7 @@ fn list_header_selection_summary(
                     .iter()
                     .filter(|id| sel.selected.contains(id))
                     .filter_map(|id| tree.node(*id))
-                    .map(|n| n.total_bytes)
+                    .map(NodeRef::total_bytes)
                     .sum();
                 (count, bytes)
             })
@@ -1201,7 +1200,7 @@ fn make_row_press_handler(
 
         let is_dir = tree
             .node(id)
-            .is_some_and(|n| n.kind == EntryKind::Directory);
+            .is_some_and(|n| n.kind() == EntryKind::Directory);
         let was_single_cursor = state::selection_signal()
             .with_untracked(|sel| sel.cursor == Some(id) && sel.selected.len() == 1);
         if is_dir && (was_single_cursor || ev.clicks >= 2) {
@@ -1244,7 +1243,7 @@ fn explorer_row_cell(ctrl: &ExplorerController, at: Position) -> View {
             .and_then(|id| {
                 label_tree
                     .node(id)
-                    .map(|n| format!("{}, {}", n.name, format_bytes(n.total_bytes)))
+                    .map(|n| format!("{}, {}", n.name(), format_bytes(n.total_bytes())))
             })
             .unwrap_or_default()
     };
@@ -1350,7 +1349,7 @@ fn row_left_group(
                 let is_dir = row_id
                     .get()
                     .and_then(|id| kind_tree.node(id))
-                    .is_some_and(|n| n.kind == EntryKind::Directory);
+                    .is_some_and(|n| n.kind() == EntryKind::Directory);
                 if is_dir { "▸" } else { "•" }
             })
             .font_family(palette::mono_font())
@@ -1369,10 +1368,10 @@ fn row_left_group(
                     .get()
                     .and_then(|id| name_tree.node(id))
                     .map(|node| {
-                        if node.kind == EntryKind::Directory {
-                            format!("{}/", node.name)
+                        if node.kind() == EntryKind::Directory {
+                            format!("{}/", node.name())
                         } else {
-                            node.name.clone()
+                            node.name().to_owned()
                         }
                     })
                     .unwrap_or_default()
@@ -1428,7 +1427,7 @@ fn row_trailing_badges(
                 row_id
                     .get()
                     .and_then(|id| hint_tree.node(id))
-                    .is_some_and(|n| n.junk_kind.is_some())
+                    .is_some_and(|n| n.junk_kind().is_some())
             },
             || {
                 text("unused")
@@ -1460,7 +1459,7 @@ fn hover_snag_button(
         .label(move || {
             let name = row_id
                 .get()
-                .and_then(|id| tree.node(id).map(|n| n.name.as_str()))
+                .and_then(|id| tree.node(id).map(NodeRef::name))
                 .unwrap_or("item");
             format!("Snag {name}")
         })
@@ -1520,7 +1519,7 @@ fn row_right_group(
             text(move || {
                 let bytes = row_id
                     .get()
-                    .and_then(|id| bytes_tree.node(id).map(|n| n.total_bytes))
+                    .and_then(|id| bytes_tree.node(id).map(NodeRef::total_bytes))
                     .unwrap_or(0);
                 format_bytes(bytes)
             })
@@ -1540,7 +1539,7 @@ fn row_right_group(
             text(move || {
                 let bytes = row_id
                     .get()
-                    .and_then(|id| pct_tree.node(id).map(|n| n.total_bytes))
+                    .and_then(|id| pct_tree.node(id).map(NodeRef::total_bytes))
                     .unwrap_or(0);
                 let total = scope_bytes.get().max(1);
                 let pct = (bytes.saturating_mul(100) / total).min(100);
@@ -1556,7 +1555,7 @@ fn row_right_group(
                 row_id
                     .get()
                     .and_then(|id| age_label_tree.node(id))
-                    .map(|node| format_age(node.modified, age_label_tree.scanned_at()).label)
+                    .map(|node| format_age(node.modified(), age_label_tree.scanned_at()).label)
                     .unwrap_or_default()
             })
             .font_family(palette::mono_font())
@@ -1567,7 +1566,7 @@ fn row_right_group(
                     .get()
                     .and_then(|id| age_color_tree.node(id))
                     .map_or(AgeFreshness::Unknown, |node| {
-                        format_age(node.modified, age_color_tree.scanned_at()).freshness
+                        format_age(node.modified(), age_color_tree.scanned_at()).freshness
                     });
                 match freshness {
                     AgeFreshness::Stale => palette::WARN_AMBER,
@@ -1597,13 +1596,13 @@ fn reactive_mini_dot_bar(
             return (0_usize, palette::DOT_EMPTY);
         };
         let total = scope_bytes.get().max(1);
-        let share = (node.total_bytes as f32 / total as f32).clamp(0.0, 1.0);
+        let share = (node.total_bytes() as f32 / total as f32).clamp(0.0, 1.0);
         let filled = if share <= 0.005 {
             0
         } else {
             ((share * total_dots as f32).round() as usize).clamp(1, total_dots)
         };
-        (filled, palette::category_color(node.category))
+        (filled, palette::category_color(node.category()))
     });
 
     view()
@@ -1624,23 +1623,24 @@ fn reactive_mini_dot_bar(
 
 fn search_parent_hint(
     tree: &StorageTree,
-    node: &DiskNode,
+    node: NodeRef<'_>,
     scope_node: Option<NodeId>,
 ) -> Option<String> {
-    let parent_rel = node.relative_path.parent()?;
+    let rel = node.relative_path();
+    let parent_rel = rel.parent()?;
     if parent_rel.as_os_str().is_empty() {
         return None;
     }
     let scope_rel = scope_node
-        .and_then(|id| tree.node(id))
-        .map_or_else(|| Path::new(""), |n| n.relative_path.as_path());
-    if parent_rel == scope_rel {
+        .map(|id| tree.relative_path(id))
+        .unwrap_or_default();
+    if parent_rel == scope_rel.as_path() {
         return None;
     }
     let shown = if scope_rel.as_os_str().is_empty() {
         parent_rel
     } else {
-        parent_rel.strip_prefix(scope_rel).unwrap_or(parent_rel)
+        parent_rel.strip_prefix(&scope_rel).unwrap_or(parent_rel)
     };
     if shown.as_os_str().is_empty() {
         return None;
@@ -1672,7 +1672,7 @@ fn row_subline(
     let culprit_text = computed(move || {
         let id = row_id.get()?;
         let node = culprit_tree.node(id)?;
-        node.largest_culprit.as_ref().map(|culprit| {
+        node.largest_culprit().map(|culprit| {
             format!(
                 "└ mostly in {}  {} · {}%",
                 culprit.relative_subpath,
@@ -1686,11 +1686,11 @@ fn row_subline(
     let meta_text = computed(move || {
         let id = row_id.get()?;
         let node = meta_tree.node(id)?;
-        if node.kind != EntryKind::Directory {
+        if node.kind() != EntryKind::Directory {
             return None;
         }
-        let item_total = node.file_count + node.dir_count;
-        let age = format_age(node.modified, meta_tree.scanned_at());
+        let item_total = node.file_count() + node.dir_count();
+        let age = format_age(node.modified(), meta_tree.scanned_at());
         Some(format!("{item_total} items · changed {}", age.label))
     });
 
@@ -1751,7 +1751,7 @@ fn selected_actions_bar(
         row_id
             .get()
             .and_then(|id| tree.node(id))
-            .is_some_and(|n| n.kind == EntryKind::Directory && n.largest_culprit.is_some())
+            .is_some_and(|n| n.kind() == EntryKind::Directory && n.largest_culprit().is_some())
     });
 
     view()
@@ -1978,12 +1978,12 @@ fn agg_tab(label: &'static str, active: bool, kind: AggregateKind) -> ButtonElem
 fn aggregate_node_list(tree: &StorageTree, ids: Vec<NodeId>) -> View {
     view().gap_1().children(ids.into_iter().filter_map(|id| {
         let node = tree.node(id)?;
-        let covered = state::snag_signal().with(|s| s.queue.is_covered(&node.relative_path));
+        let covered = state::snag_signal().with(|s| s.queue.is_node_covered(tree, id));
         if covered {
             return None;
         }
-        let accent = palette::category_color(node.category);
-        let rel = node.relative_path.display().to_string();
+        let accent = palette::category_color(node.category());
+        let rel = node.relative_path().display().to_string();
 
         Some(
             view()
@@ -2018,7 +2018,7 @@ fn aggregate_node_list(tree: &StorageTree, ids: Vec<NodeId>) -> View {
                         .items_center()
                         .gap_2()
                         .child(
-                            text(format_bytes(node.total_bytes))
+                            text(format_bytes(node.total_bytes()))
                                 .font_family(palette::mono_font())
                                 .tabular_nums()
                                 .text_size(px(12.0))

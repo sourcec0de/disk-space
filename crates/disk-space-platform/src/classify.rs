@@ -22,14 +22,15 @@ pub(crate) fn classify_entry(
     now: SystemTime,
 ) -> (StorageCategory, JunkAssessment) {
     let lower_path = path.to_string_lossy().to_ascii_lowercase();
-    let file_name = path
+    let lower_as_path = Path::new(&lower_path);
+    let file_name = lower_as_path
         .file_name()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    let ext = path
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("");
+    let ext = lower_as_path
         .extension()
-        .map(|value| value.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("");
 
     let is_stale = is_entry_stale(metadata, now);
 
@@ -40,7 +41,7 @@ pub(crate) fn classify_entry(
         );
     }
 
-    if is_cache_path(&lower_path, &file_name) {
+    if is_cache_path(&lower_path, file_name) {
         return (
             StorageCategory::Caches,
             JunkAssessment::new(Some(JunkKind::Cache), false, "regenerable cache data"),
@@ -48,13 +49,13 @@ pub(crate) fn classify_entry(
     }
 
     if let Some((category, assessment)) =
-        classify_by_location(&lower_path, &file_name, &ext, kind, is_stale)
+        classify_by_location(&lower_path, file_name, ext, kind, is_stale)
     {
         return (category, assessment);
     }
 
     if kind != EntryKind::Directory
-        && let Some((category, assessment)) = classify_by_extension(&ext, is_stale)
+        && let Some((category, assessment)) = classify_by_extension(ext, is_stale)
     {
         return (category, assessment);
     }
@@ -109,15 +110,15 @@ fn is_cache_path(lower_path: &str, file_name: &str) -> bool {
         "/cachestorage/",
         "/code cache/",
         "/gpucache/",
-        "/dawnCache/",
-        "/shaderCache/",
+        "/dawncache/",
+        "/shadercache/",
         "/crx_cache/",
         "\\appdata\\local\\temp\\",
         "/private/var/folders/",
     ];
     if CACHE_SEGMENTS
         .iter()
-        .any(|segment| lower_path.contains(&segment.to_ascii_lowercase()))
+        .any(|segment| lower_path.contains(segment))
     {
         return true;
     }
@@ -221,7 +222,7 @@ fn classify_by_extension(ext: &str, is_stale: bool) -> Option<(StorageCategory, 
         )),
         "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "c" | "cc" | "cpp" | "h" | "hpp"
         | "swift" | "kt" | "java" | "nix" | "toml" | "yaml" | "yml" | "lock" | "wasm" | "o"
-        | "rlib" | "rmeta" | "a" | "dylib" | "so" | "pdb" | "dSYM" => Some((
+        | "rlib" | "rmeta" | "a" | "dylib" | "so" | "pdb" | "dsym" => Some((
             StorageCategory::Developer,
             stale_if(is_stale, false, "source or build artifact"),
         )),

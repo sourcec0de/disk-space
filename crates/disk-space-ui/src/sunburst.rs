@@ -4,6 +4,7 @@ use std::f32::consts::FRAC_PI_2;
 use std::f32::consts::TAU;
 
 use disk_space_core::NodeId;
+use disk_space_core::NodeRef;
 use disk_space_core::StorageTree;
 use disk_space_core::format_bytes;
 use disk_space_platform::EntryKind;
@@ -46,7 +47,7 @@ fn collect_slices(tree: &StorageTree, center_node: NodeId) -> Vec<SunburstSlice>
     let Some(root_node) = tree.node(center_node) else {
         return slices;
     };
-    if root_node.total_bytes == 0 {
+    if root_node.total_bytes() == 0 {
         return slices;
     }
 
@@ -81,23 +82,23 @@ fn collect_ring(
         return;
     };
     let span = end_angle - start_angle;
-    if span < 0.035 || parent.total_bytes == 0 {
+    if span < 0.035 || parent.total_bytes() == 0 {
         return;
     }
 
     let r_inner = (ring as f32).mul_add(RING_WIDTH, HUB_RADIUS);
     let r_outer = r_inner + RING_WIDTH - 2.0;
 
-    let children = tree.children_sorted(parent_id);
     let mut cursor = start_angle;
-    for child_id in children {
+    for &child_id in tree.children_slice(parent_id) {
         let Some(child) = tree.node(child_id) else {
             continue;
         };
-        if child.total_bytes == 0 {
+        let child_bytes = child.total_bytes();
+        if child_bytes == 0 {
             continue;
         }
-        let wedge = span * (child.total_bytes as f64 / parent.total_bytes as f64) as f32;
+        let wedge = span * (child_bytes as f64 / parent.total_bytes() as f64) as f32;
         if wedge < 0.03 {
             continue;
         }
@@ -110,7 +111,7 @@ fn collect_ring(
             r_inner,
             r_outer,
         });
-        if child.kind == EntryKind::Directory {
+        if child.kind() == EntryKind::Directory {
             collect_ring(tree, child_id, ring + 1, cursor, next_angle, out);
         }
         cursor = next_angle;
@@ -165,13 +166,13 @@ fn render_sunburst(w: f32, h: f32, current_node: Option<NodeId>) -> Painter {
             continue;
         };
         let is_hovered = hover_sunburst == Some(slice.node_id);
-        let is_snagged =
-            state::snag_signal().with(|snag| snag.queue.is_covered(&node.relative_path));
+        let is_snagged = state::snag_signal()
+            .with(|snag| snag.queue.is_node_covered(&active_tree, slice.node_id));
 
         let base = if is_snagged {
             palette::DANGER_RED
         } else {
-            palette::category_color(node.category)
+            palette::category_color(node.category())
         };
         let ring_opacity = match slice.ring {
             0 => 0.92,
@@ -213,8 +214,8 @@ pub(crate) fn sunburst_panel(tree: &StorageTree, current_node: Option<NodeId>) -
     let center_node_id = current_node.unwrap_or_else(|| tree.root_id());
     let center_name = tree
         .node(center_node_id)
-        .map_or_else(|| "root".to_owned(), |node| node.name.clone());
-    let center_bytes = tree.node(center_node_id).map_or(0, |node| node.total_bytes);
+        .map_or_else(|| "root".to_owned(), |node| node.name().to_owned());
+    let center_bytes = tree.node(center_node_id).map_or(0, NodeRef::total_bytes);
     let can_ascend = center_node_id != tree.root_id();
 
     let chart = canvas(move || {
@@ -306,9 +307,9 @@ fn sunburst_info_card(center_name: &str, center_bytes: u64, can_ascend: bool) ->
                         |node| {
                             format!(
                                 "{} · {} · {} item(s)",
-                                node.name,
-                                format_bytes(node.total_bytes),
-                                node.file_count + node.dir_count
+                                node.name(),
+                                format_bytes(node.total_bytes()),
+                                node.file_count() + node.dir_count()
                             )
                         },
                     )
