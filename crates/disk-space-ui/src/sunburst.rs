@@ -296,20 +296,6 @@ fn sunburst_info_card(center_name: &str, center_bytes: u64, can_ascend: bool) ->
             .border_color(palette::BORDER_SUBTLE)
             .gap_2()
             .child(
-                text(format!(
-                    "center: {center_name} · {}{}",
-                    format_bytes(center_bytes),
-                    if can_ascend {
-                        " (click hub to go up)"
-                    } else {
-                        ""
-                    }
-                ))
-                .font_family(palette::mono_font())
-                .text_size(px(12.0))
-                .text_color(palette::TEXT_PRIMARY),
-            )
-            .child(
                 text(move || {
                     let Some(active_tree) = state::current_tree() else {
                         return String::new();
@@ -328,6 +314,28 @@ fn sunburst_info_card(center_name: &str, center_bytes: u64, can_ascend: bool) ->
                     )
                 })
                 .font_family(palette::mono_font())
+                .tabular_nums()
+                .text_size(px(12.0))
+                .text_color(move || {
+                    if state::hover_signal().with(|h| h.sunburst).is_some() {
+                        palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_MUTED
+                    }
+                }),
+            )
+            .child(
+                text(format!(
+                    "center: {center_name} · {}{}",
+                    format_bytes(center_bytes),
+                    if can_ascend {
+                        " (click hub to go up)"
+                    } else {
+                        ""
+                    }
+                ))
+                .font_family(palette::mono_font())
+                .tabular_nums()
                 .text_size(px(12.0))
                 .text_color(palette::TEXT_MUTED),
             ),
