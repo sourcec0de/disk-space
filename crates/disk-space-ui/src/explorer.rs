@@ -67,6 +67,7 @@ use nsh_core::prelude::view;
 use nsh_core::prelude::virtual_list;
 use nsh_core::prelude::when;
 
+use crate::keybindings::Action;
 use crate::palette;
 use crate::state;
 use crate::state::AggregateKind;
@@ -280,10 +281,9 @@ impl ExplorerController {
 }
 
 fn can_handle_list_keys() -> bool {
-    let modal_open = state::snag_signal().with_untracked(|s| s.confirm_open);
     let in_aggregates =
         state::browse_signal().with_untracked(|b| b.view_tab == ViewTab::Aggregates);
-    !modal_open && !in_aggregates
+    state::can_dispatch_app_shortcut() && !in_aggregates
 }
 
 fn bind_list_shortcuts(ctrl: &ExplorerController) {
@@ -367,10 +367,6 @@ fn bind_motion_keys(ctrl: &ExplorerController) {
     };
 
     for (key, step, extend) in [
-        ("down", ListMove::Down, false),
-        ("j", ListMove::Down, false),
-        ("up", ListMove::Up, false),
-        ("k", ListMove::Up, false),
         ("shift+down", ListMove::Down, true),
         ("shift+j", ListMove::Down, true),
         ("shift+up", ListMove::Up, true),
@@ -410,80 +406,125 @@ fn bind_motion_keys(ctrl: &ExplorerController) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "registers all reactive per-action list shortcuts inside one effect"
+)]
 fn bind_action_keys(ctrl: &ExplorerController) {
-    let once_opts = KeyOptions {
-        when: When::NotEditing,
-        repeat: false,
-        ..KeyOptions::default()
-    };
-
-    let select_all_ctrl = ctrl.clone();
-    on_key_with("mod+a", once_opts, move |_| {
-        if can_handle_list_keys() {
-            select_all_ctrl.select_all();
-        }
-    });
-
-    for key in ["s", "shift+s"] {
-        let snag_ctrl = ctrl.clone();
-        on_key_with(key, once_opts, move |_| {
-            if can_handle_list_keys() {
-                snag_ctrl.snag_selected();
-            }
-        });
-    }
-
-    for key in ["right", "enter"] {
-        on_key_with(key, once_opts, |_| {
-            if can_handle_list_keys()
-                && let Some(id) = ExplorerController::cursor_node_id()
-            {
-                state::open_node(id);
-            }
-        });
-    }
-    for key in ["left", "h", "backspace"] {
-        on_key_with(key, once_opts, |_| {
-            if can_handle_list_keys() {
-                state::ascend_directory();
-            }
-        });
-    }
-    on_key_with("g", once_opts, |_| {
-        if can_handle_list_keys()
-            && let Some(id) = ExplorerController::cursor_node_id()
-        {
-            state::jump_to_culprit(id);
-        }
-    });
-    on_key_with("o", once_opts, |_| {
-        if can_handle_list_keys()
-            && let Some(id) = ExplorerController::cursor_node_id()
-        {
-            state::reveal_node(id);
-        }
-    });
-
-    let slash_ctrl = ctrl.clone();
-    on_key_with("/", once_opts, move |_| {
-        if !state::snag_signal().with_untracked(|s| s.confirm_open) {
-            slash_ctrl.focus_search();
-        }
-    });
-    let find_ctrl = ctrl.clone();
-    on_key_with(
-        "mod+f",
-        KeyOptions {
-            when: When::Always,
+    let reactive_ctrl = ctrl.clone();
+    effect(move || {
+        let kb = state::keybindings_signal().get();
+        let repeat_opts = KeyOptions {
+            when: When::NotEditing,
+            repeat: true,
+            ..KeyOptions::default()
+        };
+        let once_opts = KeyOptions {
+            when: When::NotEditing,
             repeat: false,
             ..KeyOptions::default()
-        },
-        move |_| {
-            if !state::snag_signal().with_untracked(|s| s.confirm_open) {
-                find_ctrl.focus_search();
-            }
-        },
-    );
+        };
+
+        for key in kb.key_strings_for(Action::MoveDown) {
+            let move_ctrl = reactive_ctrl.clone();
+            on_key_with(key, repeat_opts, move |_| {
+                if can_handle_list_keys() {
+                    move_ctrl.move_selection(ListMove::Down, false);
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::MoveUp) {
+            let move_ctrl = reactive_ctrl.clone();
+            on_key_with(key, repeat_opts, move |_| {
+                if can_handle_list_keys() {
+                    move_ctrl.move_selection(ListMove::Up, false);
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::SelectAll) {
+            let select_all_ctrl = reactive_ctrl.clone();
+            on_key_with(key, once_opts, move |_| {
+                if can_handle_list_keys() {
+                    select_all_ctrl.select_all();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::SnagSelected) {
+            let snag_ctrl = reactive_ctrl.clone();
+            on_key_with(key, once_opts, move |_| {
+                if can_handle_list_keys() {
+                    snag_ctrl.snag_selected();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::QuickLook) {
+            on_key_with(key, once_opts, |_| {
+                if can_handle_list_keys()
+                    && let Some(id) = ExplorerController::cursor_node_id()
+                {
+                    state::preview_node(id);
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::OpenSelected) {
+            on_key_with(key, once_opts, |_| {
+                if can_handle_list_keys()
+                    && let Some(id) = ExplorerController::cursor_node_id()
+                {
+                    state::open_node(id);
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::AscendDirectory) {
+            on_key_with(key, once_opts, |_| {
+                if can_handle_list_keys() {
+                    state::ascend_directory();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::JumpToCulprit) {
+            on_key_with(key, once_opts, |_| {
+                if can_handle_list_keys()
+                    && let Some(id) = ExplorerController::cursor_node_id()
+                {
+                    state::jump_to_culprit(id);
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::RevealInFinder) {
+            on_key_with(key, once_opts, |_| {
+                if can_handle_list_keys()
+                    && let Some(id) = ExplorerController::cursor_node_id()
+                {
+                    state::reveal_node(id);
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::FocusSearch) {
+            let has_mod = key.contains("mod+")
+                || key.contains("cmd+")
+                || key.contains("ctrl+")
+                || key.contains("alt+");
+            let search_ctrl = reactive_ctrl.clone();
+            on_key_with(
+                key,
+                KeyOptions {
+                    when: if has_mod {
+                        When::Always
+                    } else {
+                        When::NotEditing
+                    },
+                    repeat: false,
+                    ..KeyOptions::default()
+                },
+                move |_| {
+                    if state::can_dispatch_app_shortcut() {
+                        search_ctrl.focus_search();
+                    }
+                },
+            );
+        }
+    });
 }
 
 /// Renders the right detail pane (breadcrumbs, search/filter strip, rows or aggregates).
@@ -898,12 +939,7 @@ fn build_breadcrumbs(
             button()
                 .accessibility_label(format!("Breadcrumb {label}"))
                 .on_press(move || {
-                    batch(|| {
-                        state::browse_signal().update(|b| {
-                            b.current_node = target;
-                        });
-                        state::selection_signal().update(SelectionState::clear);
-                    });
+                    state::navigate_to_node(target);
                 })
                 .cursor(Cursor::Pointer)
                 .child(
@@ -1785,6 +1821,15 @@ fn selected_actions_bar(
             move || {
                 if let Some(id) = row_id.get_untracked() {
                     state::reveal_node(id);
+                }
+            },
+        ))
+        .child(inline_action(
+            "space preview",
+            palette::TEXT_PRIMARY,
+            move || {
+                if let Some(id) = row_id.get_untracked() {
+                    state::preview_node(id);
                 }
             },
         ))

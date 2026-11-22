@@ -289,6 +289,10 @@ impl FileActionBackend for MacOsPlatform {
         run_open_command(&[], path)
     }
 
+    fn preview_item(&self, path: &Path) -> Result<(), PlatformError> {
+        crate::macos_quicklook::toggle_quick_look(path)
+    }
+
     fn move_to_trash(&self, path: &Path) -> Result<(), PlatformError> {
         trash::delete(path).map_err(|err| PlatformError::TrashFailed {
             path: path.to_path_buf(),

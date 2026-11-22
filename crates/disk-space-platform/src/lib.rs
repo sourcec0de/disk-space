@@ -11,6 +11,8 @@ pub mod fake;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+mod macos_quicklook;
 pub mod native;
 pub mod traits;
 pub mod types;

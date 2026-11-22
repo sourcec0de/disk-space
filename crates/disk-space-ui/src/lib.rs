@@ -8,7 +8,9 @@
 
 mod dot_matrix;
 mod explorer;
+mod keybindings;
 mod palette;
+mod settings_modal;
 mod shell;
 mod sidebar;
 mod snag_drawer;

@@ -204,6 +204,10 @@ impl FileActionBackend for WindowsPlatform {
         }
     }
 
+    fn preview_item(&self, path: &Path) -> Result<(), PlatformError> {
+        self.open_item(path)
+    }
+
     fn move_to_trash(&self, path: &Path) -> Result<(), PlatformError> {
         trash::delete(path).map_err(|err| PlatformError::TrashFailed {
             path: path.to_path_buf(),

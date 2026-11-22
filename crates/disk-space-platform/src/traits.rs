@@ -99,6 +99,14 @@ pub trait FileActionBackend: Send + Sync {
     /// Returns [`PlatformError`] if opening fails.
     fn open_item(&self, path: &Path) -> Result<(), PlatformError>;
 
+    /// Previews `path` in the OS quick-preview viewer (macOS Quick Look `qlmanage -p`,
+    /// or the default opener on platforms without a native previewer).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError`] if launching the preview fails.
+    fn preview_item(&self, path: &Path) -> Result<(), PlatformError>;
+
     /// Moves `path` to the OS Trash / Recycle Bin.
     ///
     /// # Errors

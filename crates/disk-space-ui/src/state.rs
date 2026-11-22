@@ -50,6 +50,10 @@ use nsh_core::prelude::global;
 use nsh_core::prelude::spawn;
 use nsh_core::prelude::timer;
 
+use crate::keybindings::Action;
+use crate::keybindings::InputBinding;
+use crate::keybindings::KeyBindings;
+
 /// Process-level startup configuration injected by the binary or headless tests.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -58,6 +62,8 @@ pub struct LaunchConfig {
     pub initial_root: Option<PathBuf>,
     /// Platform host factory used for OS operations (or [`disk_space_platform::FakePlatform`] in tests).
     pub host_factory: fn() -> Box<dyn PlatformHost>,
+    /// Optional path used to load and save custom keyboard & mouse bindings.
+    pub keybindings_path: Option<PathBuf>,
 }
 
 impl LaunchConfig {
@@ -70,7 +76,15 @@ impl LaunchConfig {
         Self {
             initial_root,
             host_factory,
+            keybindings_path: None,
         }
+    }
+
+    /// Configures a file path for persisting customized keybindings across launches.
+    #[must_use]
+    pub fn with_keybindings_path(mut self, path: PathBuf) -> Self {
+        self.keybindings_path = Some(path);
+        self
     }
 }
 
@@ -79,6 +93,7 @@ impl Default for LaunchConfig {
         Self {
             initial_root: None,
             host_factory: native_platform,
+            keybindings_path: None,
         }
     }
 }
@@ -384,6 +399,62 @@ pub(crate) struct NoticeState {
     pub(crate) notice: Option<StatusNotice>,
 }
 
+/// Snapshot of a browsed scope stored in the back/forward navigation stacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NavLocation {
+    pub(crate) selected_category: Option<StorageCategory>,
+    pub(crate) current_node: Option<NodeId>,
+}
+
+const MAX_NAV_HISTORY: usize = 128;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NavHistoryState {
+    pub(crate) back: Vec<NavLocation>,
+    pub(crate) forward: Vec<NavLocation>,
+}
+
+impl NavHistoryState {
+    pub(crate) fn clear(&mut self) {
+        self.back.clear();
+        self.forward.clear();
+    }
+
+    pub(crate) fn record_visit(&mut self, from: NavLocation) {
+        if self.back.last().copied() != Some(from) {
+            self.back.push(from);
+            if self.back.len() > MAX_NAV_HISTORY {
+                self.back.remove(0);
+            }
+        }
+        self.forward.clear();
+    }
+
+    pub(crate) fn step_back(&mut self, current: NavLocation) -> Option<NavLocation> {
+        let prev = self.back.pop()?;
+        self.forward.push(current);
+        Some(prev)
+    }
+
+    pub(crate) fn step_forward(&mut self, current: NavLocation) -> Option<NavLocation> {
+        let next = self.forward.pop()?;
+        self.back.push(current);
+        Some(next)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordMode {
+    Replace,
+    Add,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SettingsState {
+    pub(crate) open: bool,
+    pub(crate) recording: Option<(Action, RecordMode)>,
+}
+
 pub(crate) fn scan_signal() -> Signal<ScanState> {
     global::<ScanState>()
 }
@@ -412,9 +483,125 @@ pub(crate) fn notice_signal() -> Signal<NoticeState> {
     global::<NoticeState>()
 }
 
+pub(crate) fn nav_history_signal() -> Signal<NavHistoryState> {
+    global::<NavHistoryState>()
+}
+
+pub(crate) fn settings_signal() -> Signal<SettingsState> {
+    global::<SettingsState>()
+}
+
+pub(crate) fn keybindings_signal() -> Signal<KeyBindings> {
+    global::<KeyBindings>()
+}
+
+pub(crate) fn can_dispatch_app_shortcut() -> bool {
+    let confirm_open = snag_signal().with_untracked(|s| s.confirm_open);
+    let settings_open = settings_signal().with_untracked(|s| s.open);
+    !confirm_open && !settings_open
+}
+
+fn configured_keybindings_path() -> Option<PathBuf> {
+    config_lock()
+        .read()
+        .ok()
+        .and_then(|cfg| cfg.keybindings_path.clone())
+}
+
+fn persist_keybindings() {
+    if let Some(path) = configured_keybindings_path() {
+        let kb = keybindings_signal().get_untracked();
+        if let Err(err) = kb.save_to_path(&path) {
+            set_notice(NoticeTone::Warn, format!("Failed to save shortcuts: {err}"));
+        }
+    }
+}
+
+pub(crate) fn close_settings() {
+    settings_signal().update(|s| {
+        s.open = false;
+        s.recording = None;
+    });
+}
+
+pub(crate) fn toggle_settings() {
+    settings_signal().update(|s| {
+        s.open = !s.open;
+        s.recording = None;
+    });
+}
+
+pub(crate) fn start_recording_binding(action: Action, mode: RecordMode) {
+    settings_signal().update(|s| {
+        s.open = true;
+        s.recording = Some((action, mode));
+    });
+}
+
+pub(crate) fn cancel_recording_binding() {
+    settings_signal().update(|s| {
+        s.recording = None;
+    });
+}
+
+pub(crate) fn apply_recorded_binding(binding: InputBinding) {
+    let Some((action, mode)) = settings_signal().with_untracked(|s| s.recording) else {
+        return;
+    };
+    let replace = mode == RecordMode::Replace;
+    let label = binding.display_label();
+    let mut displaced = None;
+    batch(|| {
+        keybindings_signal().update(|kb| {
+            displaced = kb.set_binding(action, binding, replace);
+        });
+        settings_signal().update(|s| {
+            s.recording = None;
+        });
+    });
+    persist_keybindings();
+    if let Some(prev_action) = displaced {
+        set_notice(
+            NoticeTone::Info,
+            format!(
+                "Bound {label} to {} (removed from {})",
+                action.label(),
+                prev_action.label()
+            ),
+        );
+    } else {
+        set_notice(
+            NoticeTone::Info,
+            format!("Bound {label} to {}", action.label()),
+        );
+    }
+}
+
+pub(crate) fn remove_action_binding(action: Action, idx: usize) {
+    keybindings_signal().update(|kb| kb.remove_binding(action, idx));
+    persist_keybindings();
+}
+
+pub(crate) fn reset_action_binding(action: Action) {
+    keybindings_signal().update(|kb| kb.reset_action(action));
+    persist_keybindings();
+}
+
+pub(crate) fn reset_all_keybindings() {
+    batch(|| {
+        keybindings_signal().update(KeyBindings::reset_all);
+        settings_signal().update(|s| s.recording = None);
+    });
+    persist_keybindings();
+    set_notice(NoticeTone::Info, "Reset all shortcuts to defaults");
+}
+
 pub(crate) fn ensure_started() {
     let should_start = scan_signal().with_untracked(|state| !state.started);
     if should_start {
+        if let Some(path) = configured_keybindings_path() {
+            keybindings_signal().set(KeyBindings::load_from_path(&path));
+        }
         let root_owner = Owner::current();
         scan_signal().update(|state| state.app_owner = Some(root_owner));
         let initial = default_initial_root();
@@ -458,6 +645,7 @@ pub(crate) fn start_scan(root_path: PathBuf) {
         browse_signal().update(|browse| {
             browse.current_node = None;
         });
+        nav_history_signal().update(NavHistoryState::clear);
         hover_signal().update(|hover| {
             hover.sunburst = None;
         });
@@ -839,15 +1027,86 @@ pub(crate) fn clear_notice() {
     notice_signal().set(NoticeState { notice: None });
 }
 
-pub(crate) fn select_category(category: Option<StorageCategory>) {
+fn current_nav_location() -> NavLocation {
+    browse_signal().with_untracked(|b| NavLocation {
+        selected_category: b.selected_category,
+        current_node: b.current_node,
+    })
+}
+
+/// Navigates to `(selected_category, current_node)`, recording the previous location in history.
+pub(crate) fn navigate_to(
+    selected_category: Option<StorageCategory>,
+    current_node: Option<NodeId>,
+    clear_search: bool,
+) {
+    let from = current_nav_location();
+    let dest = NavLocation {
+        selected_category,
+        current_node,
+    };
     batch(|| {
+        if dest != from {
+            nav_history_signal().update(|hist| hist.record_visit(from));
+        }
         browse_signal().update(|browse| {
-            browse.selected_category = category;
-            browse.current_node = None;
+            browse.selected_category = selected_category;
+            browse.current_node = current_node;
+            if clear_search {
+                browse.search_text.clear();
+            }
         });
         hover_signal().update(|hover| hover.sunburst = None);
         selection_signal().update(SelectionState::clear);
     });
+}
+
+/// Navigates to `target` within the currently selected category (used by breadcrumbs).
+pub(crate) fn navigate_to_node(target: Option<NodeId>) {
+    let cat = browse_signal().with_untracked(|b| b.selected_category);
+    navigate_to(cat, target, false);
+}
+
+/// Navigates one step backward in browsing history, if available.
+pub(crate) fn navigate_back() {
+    let current = current_nav_location();
+    let mut target = None;
+    nav_history_signal().update(|hist| {
+        target = hist.step_back(current);
+    });
+    if let Some(loc) = target {
+        batch(|| {
+            browse_signal().update(|browse| {
+                browse.selected_category = loc.selected_category;
+                browse.current_node = loc.current_node;
+            });
+            hover_signal().update(|hover| hover.sunburst = None);
+            selection_signal().update(SelectionState::clear);
+        });
+    }
+}
+
+/// Navigates one step forward in browsing history, if available.
+pub(crate) fn navigate_forward() {
+    let current = current_nav_location();
+    let mut target = None;
+    nav_history_signal().update(|hist| {
+        target = hist.step_forward(current);
+    });
+    if let Some(loc) = target {
+        batch(|| {
+            browse_signal().update(|browse| {
+                browse.selected_category = loc.selected_category;
+                browse.current_node = loc.current_node;
+            });
+            hover_signal().update(|hover| hover.sunburst = None);
+            selection_signal().update(SelectionState::clear);
+        });
+    }
+}
+
+pub(crate) fn select_category(category: Option<StorageCategory>) {
+    navigate_to(category, None, false);
 }
 
 pub(crate) fn open_node(node_id: NodeId) {
@@ -858,14 +1117,8 @@ pub(crate) fn open_node(node_id: NodeId) {
         return;
     };
     if node.kind() == disk_space_platform::EntryKind::Directory {
-        batch(|| {
-            browse_signal().update(|browse| {
-                browse.current_node = Some(node_id);
-                browse.search_text.clear();
-            });
-            hover_signal().update(|hover| hover.sunburst = None);
-            selection_signal().update(SelectionState::clear);
-        });
+        let cat = browse_signal().with_untracked(|b| b.selected_category);
+        navigate_to(cat, Some(node_id), true);
     } else {
         let abs = tree.absolute_path(node_id);
         let host = create_host();
@@ -879,22 +1132,20 @@ pub(crate) fn ascend_directory() {
     let Some(tree) = current_tree_untracked() else {
         return;
     };
-    batch(|| {
-        browse_signal().update(|browse| {
-            if let Some(current) = browse.current_node {
-                let parent = tree.parent_of(current);
-                if current == tree.root_id()
-                    || (parent == Some(tree.root_id()) && browse.selected_category.is_some())
-                {
-                    browse.current_node = None;
-                } else {
-                    browse.current_node = parent;
-                }
-            }
-        });
-        hover_signal().update(|hover| hover.sunburst = None);
-        selection_signal().update(SelectionState::clear);
-    });
+    let (selected_cat, current_node) =
+        browse_signal().with_untracked(|b| (b.selected_category, b.current_node));
+    let Some(current) = current_node else {
+        return;
+    };
+    let parent = tree.parent_of(current);
+    let next_node = if current == tree.root_id()
+        || (parent == Some(tree.root_id()) && selected_cat.is_some())
+    {
+        None
+    } else {
+        parent
+    };
+    navigate_to(selected_cat, next_node, false);
 }
 
 pub(crate) fn jump_to_culprit(node_id: NodeId) {
@@ -911,21 +1162,13 @@ pub(crate) fn jump_to_culprit(node_id: NodeId) {
     let Some(target) = tree.node(target_id) else {
         return;
     };
+    let cat = browse_signal().with_untracked(|b| b.selected_category);
 
     if target.kind() == disk_space_platform::EntryKind::Directory {
-        batch(|| {
-            browse_signal().update(|browse| {
-                browse.current_node = Some(target_id);
-            });
-            selection_signal().update(SelectionState::clear);
-        });
+        navigate_to(cat, Some(target_id), false);
     } else if let Some(parent) = target.parent() {
-        batch(|| {
-            browse_signal().update(|browse| {
-                browse.current_node = Some(parent);
-            });
-            selection_signal().update(|sel| sel.select_single(target_id));
-        });
+        navigate_to(cat, Some(parent), false);
+        selection_signal().update(|sel| sel.select_single(target_id));
     }
 }
 
@@ -936,6 +1179,18 @@ pub(crate) fn reveal_node(node_id: NodeId) {
     let abs = tree.absolute_path(node_id);
     let host = create_host();
     if let Err(err) = host.reveal_in_file_manager(&abs) {
+        set_notice(NoticeTone::Warn, err.to_string());
+    }
+}
+
+/// Opens or toggles macOS Quick Look (or default previewer) on `node_id`.
+pub(crate) fn preview_node(node_id: NodeId) {
+    let Some(tree) = current_tree_untracked() else {
+        return;
+    };
+    let abs = tree.absolute_path(node_id);
+    let host = create_host();
+    if let Err(err) = host.preview_item(&abs) {
         set_notice(NoticeTone::Warn, err.to_string());
     }
 }
@@ -1258,6 +1513,20 @@ enum DestroyWorkerMsg {
     Done(DestructionReport, Option<disk_space_platform::VolumeInfo>),
 }
 
+/// Executes the staged destruction queue when the confirmation dialog is open and ready.
+pub(crate) fn confirm_execute_if_ready() {
+    let ready = snag_signal().with_untracked(|snag| {
+        if !snag.confirm_open || snag.running || snag.queue.items().is_empty() {
+            return false;
+        }
+        let requires_phrase = matches!(snag.mode, DestructionMode::SecureErase { .. });
+        !requires_phrase || snag.erase_input.trim() == "ERASE"
+    });
+    if ready {
+        run_staged_destruction();
+    }
+}
+
 /// Runs the currently staged destruction queue asynchronously and prunes deleted items.
 pub(crate) fn run_staged_destruction() {
     let Some(tree) = current_tree_untracked() else {
@@ -1398,12 +1667,12 @@ pub(crate) fn select_node_in_parent(node_id: NodeId) {
         return;
     };
     let parent = node.parent().unwrap_or_else(|| tree.root_id());
+    let cat = browse_signal().with_untracked(|b| b.selected_category);
+    navigate_to(cat, Some(parent), false);
     batch(|| {
         browse_signal().update(|browse| {
-            browse.current_node = Some(parent);
             browse.view_tab = ViewTab::DotMatrix;
         });
-        hover_signal().update(|hover| hover.sunburst = None);
         selection_signal().update(|sel| sel.select_single(node_id));
     });
 }
@@ -1478,5 +1747,40 @@ mod tests {
         sel.reconcile(&remaining);
         assert_eq!(sel.cursor, Some(ids[0]));
         assert_eq!(sel.selected_in_order(&remaining), vec![ids[0]]);
+    }
+
+    #[test]
+    fn nav_history_tracks_back_forward_and_truncates_forward_on_new_visit() {
+        let ids = test_ids();
+        let root_loc = NavLocation {
+            selected_category: None,
+            current_node: None,
+        };
+        let a_loc = NavLocation {
+            selected_category: None,
+            current_node: Some(ids[0]),
+        };
+        let b_loc = NavLocation {
+            selected_category: None,
+            current_node: Some(ids[1]),
+        };
+        let c_loc = NavLocation {
+            selected_category: Some(StorageCategory::Caches),
+            current_node: None,
+        };
+
+        let mut hist = NavHistoryState::default();
+        hist.record_visit(root_loc);
+        hist.record_visit(a_loc);
+
+        assert_eq!(hist.step_back(b_loc), Some(a_loc));
+        assert_eq!(hist.step_back(a_loc), Some(root_loc));
+        assert_eq!(hist.step_back(root_loc), None);
+
+        assert_eq!(hist.step_forward(root_loc), Some(a_loc));
+        // Visiting a new location clears the remaining forward stack (b_loc).
+        hist.record_visit(a_loc);
+        assert_eq!(hist.step_forward(c_loc), None);
+        assert_eq!(hist.step_back(c_loc), Some(a_loc));
     }
 }

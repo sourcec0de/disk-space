@@ -66,7 +66,16 @@ fn main() -> impl Termination {
         Err(code) => return code,
     };
 
-    configure_launch(LaunchConfig::new(initial_root, native_platform));
+    let mut config = LaunchConfig::new(initial_root, native_platform);
+    if let Some(home) = env::var_os("HOME") {
+        config = config.with_keybindings_path(
+            PathBuf::from(home)
+                .join(".config")
+                .join("disk-space")
+                .join("keybindings.conf"),
+        );
+    }
+    configure_launch(config);
 
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<App>()),

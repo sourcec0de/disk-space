@@ -9,16 +9,25 @@ use disk_space_core::format_bytes;
 use nsh_base::button;
 use nsh_core::file_dialog::OpenDialog;
 use nsh_core::keymap::When;
+use nsh_core::prelude::ComponentBuilder;
 use nsh_core::prelude::Cursor;
+use nsh_core::prelude::Element;
 use nsh_core::prelude::FontWeight;
+use nsh_core::prelude::Interactive;
 use nsh_core::prelude::IntoElement;
+use nsh_core::prelude::KeyCapture;
+use nsh_core::prelude::KeyEvent;
 use nsh_core::prelude::KeyOptions;
+use nsh_core::prelude::MouseButton;
+use nsh_core::prelude::MouseEvent;
 use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::Styled;
 use nsh_core::prelude::View;
 use nsh_core::prelude::batch;
 use nsh_core::prelude::computed;
 use nsh_core::prelude::dynamic;
+use nsh_core::prelude::effect;
+use nsh_core::prelude::element_ref;
 use nsh_core::prelude::on_key_with;
 use nsh_core::prelude::pick_paths;
 use nsh_core::prelude::px;
@@ -27,7 +36,11 @@ use nsh_core::prelude::view;
 
 use crate::dot_matrix;
 use crate::explorer;
+use crate::keybindings::Action;
+use crate::keybindings::InputBinding;
+use crate::keybindings::key_event_to_binding;
 use crate::palette;
+use crate::settings_modal;
 use crate::sidebar;
 use crate::snag_drawer;
 use crate::state;
@@ -39,12 +52,34 @@ use crate::state::ViewTab;
 pub(crate) fn shell() -> impl IntoElement {
     register_shortcuts();
 
+    let recorder_ref = element_ref();
+    effect(move || {
+        if state::settings_signal().with(|s| s.recording.is_some()) {
+            recorder_ref.focus();
+        } else {
+            recorder_ref.blur();
+        }
+    });
+
     view()
         .flex_1()
         .bg(palette::BG_CANVAS)
+        .on_mouse_up(handle_global_mouse_up)
         .px_6()
         .py_5()
         .gap_4()
+        .child(
+            view()
+                .element_ref(&recorder_ref)
+                .focusable(true)
+                .capture_keys(KeyCapture::All)
+                .on_key_down(handle_recording_key_down)
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .w(px(1.0))
+                .h(px(1.0)),
+        )
         .child(top_header_bar())
         .child(capacity_headline())
         .child(notice_banner())
@@ -63,6 +98,7 @@ pub(crate) fn shell() -> impl IntoElement {
                 ScanPhase::Ready(ref tree) => ready_workspace(tree),
             }
         }))
+        .child(dynamic(settings_modal::settings_modal))
         .child(dynamic(snag_drawer::confirm_modal))
 }
 
@@ -163,6 +199,7 @@ fn header_left_group() -> View {
                 .text_size(px(13.0))
                 .text_color(palette::TEXT_PRIMARY),
         )
+        .child(nav_history_buttons())
         .child(
             text(move || {
                 state::current_tree().map_or_else(
@@ -267,6 +304,7 @@ fn header_right_group() -> View {
                 .child(view_tab_btn("Sunburst", ViewTab::Sunburst))
                 .child(view_tab_btn("Aggregates", ViewTab::Aggregates)),
         )
+        .child(settings_toggle_btn())
         .child(
             button()
                 .accessibility_label("Toggle destruction queue drawer")
@@ -314,6 +352,43 @@ fn header_right_group() -> View {
                         }
                     }),
                 ),
+        )
+}
+
+fn settings_toggle_btn() -> impl IntoElement {
+    button()
+        .accessibility_label("Keyboard and mouse settings")
+        .on_press(state::toggle_settings)
+        .px_2()
+        .py(px(3.0))
+        .rounded_sm()
+        .cursor(Cursor::Pointer)
+        .bg(move || {
+            if state::settings_signal().with(|s| s.open) {
+                palette::BG_SELECTED
+            } else {
+                palette::BG_SURFACE
+            }
+        })
+        .border_1()
+        .border_color(move || {
+            if state::settings_signal().with(|s| s.open) {
+                palette::BORDER_ACTIVE
+            } else {
+                palette::BORDER_SUBTLE
+            }
+        })
+        .child(
+            text("Keys")
+                .font_family(palette::mono_font())
+                .text_size(px(11.0))
+                .text_color(move || {
+                    if state::settings_signal().with(|s| s.open) {
+                        palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_MUTED
+                    }
+                }),
         )
 }
 
@@ -444,51 +519,241 @@ fn open_root_picker() {
     });
 }
 
-fn register_shortcuts() {
-    let app_opts = KeyOptions {
-        when: When::NotEditing,
-        ..KeyOptions::default()
-    };
+fn nav_history_buttons() -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(
+            button()
+                .accessibility_label("Navigate back")
+                .disabled(move || state::nav_history_signal().with(|h| h.back.is_empty()))
+                .on_press(state::navigate_back)
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded_sm()
+                .bg(palette::BG_SURFACE)
+                .border_1()
+                .border_color(palette::BORDER_SUBTLE)
+                .disabled_style(|s| s.opacity(0.35))
+                .cursor(Cursor::Pointer)
+                .child(
+                    text("‹")
+                        .font_family(palette::mono_font())
+                        .text_size(px(12.0))
+                        .text_color(palette::TEXT_PRIMARY),
+                ),
+        )
+        .child(
+            button()
+                .accessibility_label("Navigate forward")
+                .disabled(move || state::nav_history_signal().with(|h| h.forward.is_empty()))
+                .on_press(state::navigate_forward)
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded_sm()
+                .bg(palette::BG_SURFACE)
+                .border_1()
+                .border_color(palette::BORDER_SUBTLE)
+                .disabled_style(|s| s.opacity(0.35))
+                .cursor(Cursor::Pointer)
+                .child(
+                    text("›")
+                        .font_family(palette::mono_font())
+                        .text_size(px(12.0))
+                        .text_color(palette::TEXT_PRIMARY),
+                ),
+        )
+}
 
-    on_key_with("f", app_opts, |_| {
-        batch(|| {
-            state::browse_signal().update(|b| {
-                b.filter_mode = match b.filter_mode {
-                    FilterMode::All => FilterMode::JunkAndUnusedOnly,
-                    FilterMode::JunkAndUnusedOnly | _ => FilterMode::All,
-                };
-            });
-            state::selection_signal().update(state::SelectionState::clear);
-        });
-    });
-    on_key_with("d", app_opts, |_| {
-        state::snag_signal().update(|s| s.drawer_open = !s.drawer_open);
-    });
-    on_key_with("v", app_opts, |_| {
+fn toggle_junk_filter() {
+    batch(|| {
         state::browse_signal().update(|b| {
-            b.view_tab = match b.view_tab {
-                ViewTab::DotMatrix => ViewTab::Sunburst,
-                ViewTab::Sunburst => ViewTab::Aggregates,
-                ViewTab::Aggregates => ViewTab::DotMatrix,
+            b.filter_mode = match b.filter_mode {
+                FilterMode::All => FilterMode::JunkAndUnusedOnly,
+                FilterMode::JunkAndUnusedOnly | _ => FilterMode::All,
             };
         });
+        state::selection_signal().update(state::SelectionState::clear);
     });
-    on_key_with("r", app_opts, |_| {
-        if let Some(root) = state::scan_signal().with_untracked(|s| s.root_path.clone()) {
-            state::start_scan(root);
+}
+
+fn cycle_view_tab() {
+    state::browse_signal().update(|b| {
+        b.view_tab = match b.view_tab {
+            ViewTab::DotMatrix => ViewTab::Sunburst,
+            ViewTab::Sunburst => ViewTab::Aggregates,
+            ViewTab::Aggregates => ViewTab::DotMatrix,
+        };
+    });
+}
+
+fn rescan_active_root() {
+    if let Some(root) = state::scan_signal().with_untracked(|s| s.root_path.clone()) {
+        state::start_scan(root);
+    }
+}
+
+fn handle_global_mouse_up(ev: &MouseEvent) {
+    let Some(button) = ev.button else {
+        return;
+    };
+    if !matches!(
+        button,
+        MouseButton::Back | MouseButton::Forward | MouseButton::Middle
+    ) {
+        return;
+    }
+
+    if state::settings_signal().with_untracked(|s| s.recording.is_some()) {
+        state::apply_recorded_binding(InputBinding::mouse(button, ev.modifiers));
+        return;
+    }
+
+    if !state::can_dispatch_app_shortcut() {
+        return;
+    }
+
+    let action =
+        state::keybindings_signal().with_untracked(|kb| kb.action_for_mouse(button, ev.modifiers));
+    if let Some(action) = action {
+        dispatch_mouse_action(action);
+    }
+}
+
+fn dispatch_mouse_action(action: Action) {
+    match action {
+        Action::NavigateBack => state::navigate_back(),
+        Action::NavigateForward => state::navigate_forward(),
+        Action::AscendDirectory => state::ascend_directory(),
+        Action::ToggleJunkFilter => toggle_junk_filter(),
+        Action::ToggleQueueDrawer => {
+            state::snag_signal().update(|s| s.drawer_open = !s.drawer_open);
+        }
+        Action::CycleViewTab => cycle_view_tab(),
+        Action::RescanRoot => rescan_active_root(),
+        Action::ReviewAndExecute => state::open_destruction_review(),
+        Action::OpenSettings => state::toggle_settings(),
+        Action::QuickLook => {
+            if let Some(id) = state::selection_signal().with_untracked(|sel| sel.cursor) {
+                state::preview_node(id);
+            }
+        }
+        Action::RevealInFinder => {
+            if let Some(id) = state::selection_signal().with_untracked(|sel| sel.cursor) {
+                state::reveal_node(id);
+            }
+        }
+        Action::OpenSelected => {
+            if let Some(id) = state::selection_signal().with_untracked(|sel| sel.cursor) {
+                state::open_node(id);
+            }
+        }
+        Action::JumpToCulprit => {
+            if let Some(id) = state::selection_signal().with_untracked(|sel| sel.cursor) {
+                state::jump_to_culprit(id);
+            }
+        }
+        Action::SnagSelected => {
+            if let Some(id) = state::selection_signal().with_untracked(|sel| sel.cursor) {
+                state::snag_node(id);
+            }
+        }
+        Action::FocusSearch | Action::MoveDown | Action::MoveUp | Action::SelectAll => {}
+    }
+}
+
+fn shortcut_opts(spec: &str, always_when_modified: bool) -> KeyOptions {
+    let has_modifier = spec.contains("mod+")
+        || spec.contains("cmd+")
+        || spec.contains("ctrl+")
+        || spec.contains("alt+");
+    KeyOptions {
+        when: if always_when_modified && has_modifier {
+            When::Always
+        } else {
+            When::NotEditing
+        },
+        repeat: false,
+        ..KeyOptions::default()
+    }
+}
+
+fn register_shortcuts() {
+    effect(|| {
+        let kb = state::keybindings_signal().get();
+
+        for key in kb.key_strings_for(Action::ToggleJunkFilter) {
+            on_key_with(key, shortcut_opts(key, false), |_| {
+                if state::can_dispatch_app_shortcut() {
+                    toggle_junk_filter();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::ToggleQueueDrawer) {
+            on_key_with(key, shortcut_opts(key, false), |_| {
+                if state::can_dispatch_app_shortcut() {
+                    state::snag_signal().update(|s| s.drawer_open = !s.drawer_open);
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::CycleViewTab) {
+            on_key_with(key, shortcut_opts(key, false), |_| {
+                if state::can_dispatch_app_shortcut() {
+                    cycle_view_tab();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::RescanRoot) {
+            on_key_with(key, shortcut_opts(key, false), |_| {
+                if state::can_dispatch_app_shortcut() {
+                    rescan_active_root();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::NavigateBack) {
+            on_key_with(key, shortcut_opts(key, true), |_| {
+                if state::can_dispatch_app_shortcut() {
+                    state::navigate_back();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::NavigateForward) {
+            on_key_with(key, shortcut_opts(key, true), |_| {
+                if state::can_dispatch_app_shortcut() {
+                    state::navigate_forward();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::ReviewAndExecute) {
+            on_key_with(key, shortcut_opts(key, true), |_| {
+                if state::can_dispatch_app_shortcut() {
+                    state::open_destruction_review();
+                }
+            });
+        }
+        for key in kb.key_strings_for(Action::OpenSettings) {
+            on_key_with(key, shortcut_opts(key, true), |_| {
+                if !state::snag_signal().with_untracked(|s| s.confirm_open) {
+                    state::toggle_settings();
+                }
+            });
         }
     });
-    on_key_with(
-        "mod+enter",
-        KeyOptions {
-            when: When::Always,
-            repeat: false,
-            ..KeyOptions::default()
-        },
-        |_| {
-            state::open_destruction_review();
-        },
-    );
+
+    let confirm_open = computed(|| state::snag_signal().with(|s| s.confirm_open));
+    effect(move || {
+        if confirm_open.get() {
+            on_key_with(
+                "enter",
+                KeyOptions {
+                    when: When::Always,
+                    ..KeyOptions::default()
+                },
+                |_| state::confirm_execute_if_ready(),
+            );
+        }
+    });
 
     on_key_with(
         "escape",
@@ -496,31 +761,57 @@ fn register_shortcuts() {
             when: When::Always,
             ..KeyOptions::default()
         },
-        |_| {
-            let confirm_open = state::snag_signal().with_untracked(|s| s.confirm_open);
-            if confirm_open {
-                state::snag_signal().update(|s| {
-                    s.confirm_open = false;
-                    s.erase_input.clear();
-                });
-                return;
-            }
-            let has_multi = state::selection_signal().with_untracked(|sel| sel.selected.len() > 1);
-            if has_multi {
-                state::selection_signal().update(state::SelectionState::collapse_to_cursor);
-                return;
-            }
-            let has_search = state::browse_signal().with_untracked(|b| !b.search_text.is_empty());
-            if has_search {
-                batch(|| {
-                    state::browse_signal().update(|b| {
-                        b.search_text.clear();
-                    });
-                    state::selection_signal().update(state::SelectionState::clear);
-                });
-                return;
-            }
-            state::ascend_directory();
-        },
+        |_| handle_escape(),
     );
+}
+
+fn handle_escape() {
+    let settings = state::settings_signal().get_untracked();
+    if settings.recording.is_some() {
+        state::cancel_recording_binding();
+        return;
+    }
+    if settings.open {
+        state::close_settings();
+        return;
+    }
+    let confirm_open = state::snag_signal().with_untracked(|s| s.confirm_open);
+    if confirm_open {
+        state::snag_signal().update(|s| {
+            s.confirm_open = false;
+            s.erase_input.clear();
+        });
+        return;
+    }
+    let has_multi = state::selection_signal().with_untracked(|sel| sel.selected.len() > 1);
+    if has_multi {
+        state::selection_signal().update(state::SelectionState::collapse_to_cursor);
+        return;
+    }
+    let has_search = state::browse_signal().with_untracked(|b| !b.search_text.is_empty());
+    if has_search {
+        batch(|| {
+            state::browse_signal().update(|b| {
+                b.search_text.clear();
+            });
+            state::selection_signal().update(state::SelectionState::clear);
+        });
+        return;
+    }
+    state::ascend_directory();
+}
+
+fn handle_recording_key_down(ev: &KeyEvent) {
+    if state::settings_signal().with_untracked(|s| s.recording.is_none()) {
+        return;
+    }
+    if ev.key.as_str().eq_ignore_ascii_case("Escape")
+        && ev.modifiers == nsh_core::keymap::Modifiers::default()
+    {
+        state::cancel_recording_binding();
+        return;
+    }
+    if let Some(binding) = key_event_to_binding(ev) {
+        state::apply_recorded_binding(binding);
+    }
 }

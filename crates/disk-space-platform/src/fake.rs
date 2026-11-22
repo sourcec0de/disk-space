@@ -32,6 +32,7 @@ pub struct FakePlatform {
     trashed: Mutex<Vec<PathBuf>>,
     revealed: Mutex<Vec<PathBuf>>,
     opened: Mutex<Vec<PathBuf>>,
+    previewed: Mutex<Vec<PathBuf>>,
     device_overrides: Mutex<Vec<(PathBuf, DeviceId)>>,
 }
 
@@ -57,6 +58,7 @@ impl FakePlatform {
             trashed: Mutex::new(Vec::new()),
             revealed: Mutex::new(Vec::new()),
             opened: Mutex::new(Vec::new()),
+            previewed: Mutex::new(Vec::new()),
             device_overrides: Mutex::new(Vec::new()),
         }
     }
@@ -97,6 +99,15 @@ impl FakePlatform {
     #[must_use]
     pub fn opened_paths(&self) -> Vec<PathBuf> {
         self.opened
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns paths passed to `preview_item`.
+    #[must_use]
+    pub fn previewed_paths(&self) -> Vec<PathBuf> {
+        self.previewed
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
@@ -247,6 +258,13 @@ impl FileActionBackend for FakePlatform {
 
     fn open_item(&self, path: &Path) -> Result<(), PlatformError> {
         if let Ok(mut guard) = self.opened.lock() {
+            guard.push(path.to_path_buf());
+        }
+        Ok(())
+    }
+
+    fn preview_item(&self, path: &Path) -> Result<(), PlatformError> {
+        if let Ok(mut guard) = self.previewed.lock() {
             guard.push(path.to_path_buf());
         }
         Ok(())

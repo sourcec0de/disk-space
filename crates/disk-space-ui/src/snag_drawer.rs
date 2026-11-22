@@ -12,12 +12,12 @@ use nsh_core::prelude::FontWeight;
 use nsh_core::prelude::ParentElement;
 use nsh_core::prelude::Styled;
 use nsh_core::prelude::View;
-use nsh_core::prelude::key_label;
 use nsh_core::prelude::px;
 use nsh_core::prelude::scroll;
 use nsh_core::prelude::text;
 use nsh_core::prelude::view;
 
+use crate::keybindings::Action;
 use crate::palette;
 use crate::state;
 
@@ -242,10 +242,14 @@ pub(crate) fn snag_drawer(tree: &StorageTree) -> View {
                         .text_color(palette::DANGER_RED),
                 )
                 .child(
-                    text(key_label("mod+enter"))
-                        .font_family(palette::mono_font())
-                        .text_size(px(10.0))
-                        .text_color(palette::TEXT_MUTED),
+                    text(move || {
+                        state::keybindings_signal()
+                            .with(|kb| kb.primary_label(Action::ReviewAndExecute))
+                            .unwrap_or_default()
+                    })
+                    .font_family(palette::mono_font())
+                    .text_size(px(10.0))
+                    .text_color(palette::TEXT_MUTED),
                 ),
         );
 
@@ -401,6 +405,7 @@ pub(crate) fn confirm_modal() -> Option<View> {
                         .on_change(move |val: &str| {
                             state::snag_signal().update(|s| val.clone_into(&mut s.erase_input));
                         })
+                        .on_submit(|_: &str| state::confirm_execute_if_ready())
                         .placeholder("ERASE")
                         .px_3()
                         .py_2()
@@ -536,7 +541,7 @@ pub(crate) fn confirm_modal() -> Option<View> {
                                         text(if snag.running {
                                             "Executing..."
                                         } else {
-                                            "Confirm Execute"
+                                            "Confirm Execute ↩"
                                         })
                                         .font_family(palette::mono_font())
                                         .font_weight(FontWeight::SEMIBOLD)
